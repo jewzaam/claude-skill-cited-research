@@ -61,101 +61,8 @@ The `cited-research` repo maintains two root-level files:
 ## Updating Existing Research
 
 When the user wants to update an existing research topic rather than create a new
-one, follow this workflow. It replaces Phase 0 and then feeds into Phases 1-5.
-
-### Step 1: Identify the Target Topic
-
-If the current working directory is inside the `cited-research` repo, read
-`index.md` to get the list of existing topics. Ask the user which topic to
-update — they can specify by:
-- Directory path (e.g., `research/security-skills/`)
-- Topic name as it appears in `index.md`
-- A description that you match against index entries
-
-If not in the `cited-research` repo, ask the user for the path to the research
-directory to update.
-
-### Step 2: Read Existing Research State
-
-Read the target topic's key files to understand what exists:
-1. `README.md` — current summary and decision framework
-2. `<deliverable>.md` — full analysis
-3. `citations.md` — all existing sources
-4. `references/*.md` — dimension files (scan filenames and read headers)
-5. `audit/` — prior verification results
-
-Build a mental model of: what dimensions were covered, what conclusions were
-reached, how old the sources are, and what the audit found last time. Unresolved
-audit findings (issues without `**Status: RESOLVED**`) are strong candidates for
-re-research in Step 4.
-
-### Step 3: Scan for Adjacent Research
-
-Read `index.md` and identify topics whose dimensions overlap with or relate to
-the target topic. For each adjacent topic, read its `README.md` to understand
-whether it contains context that could inform the update.
-
-Present adjacent topics to the user with a brief explanation of what
-cross-pollination each might offer. Examples:
-- "The security-skills research covers dependency risk tooling that may have
-  updated capabilities relevant to otel's dependency surface"
-- "The engineering-estimate research has updated RCT data on AI productivity
-  that could refine the mono-vs-micro agent capability assumptions"
-
-This step provides **input context only** — the adjacent research informs what
-dimensions to consider for the update but does not get modified during this run.
-
-### Step 4: Propose Update Scope
-
-Present the user with:
-
-1. **Existing dimensions** — list each with a recommendation:
-   - **Re-research**: Sources are stale, landscape has changed, or prior audit
-     found issues
-   - **Refresh citations**: Spot-check existing sources for accessibility and
-     accuracy; add new sources if the field has evolved
-   - **Keep as-is**: Still accurate and current
-2. **New dimensions** — informed by adjacent research or by developments since
-   the original research was conducted. Explain why each adds value.
-3. **Dimensions to retire** — if any original dimensions are no longer relevant
-
-Wait for user approval before proceeding.
-
-### Step 5: Execute Update
-
-For approved dimensions, proceed through Phases 1-5 with these modifications:
-
-- **Phase 1 (Research):** Launch research agents for all approved dimensions.
-  For re-research and new dimensions, use the standard research agent prompt.
-  For refresh-citations dimensions, use the same research agent but scope its
-  task to: verify accessibility of existing sources, check whether cited data
-  has been updated or superseded, and search for recent developments.
-- **Phase 2 (Organization):** Update `citations.md` incrementally — append new
-  sources with the next sequential number. Do not renumber existing citations.
-  Update affected `references/*.md` files. Create new reference files for new
-  dimensions.
-- **Phase 3 (Writing):** Rewrite the deliverable and README to incorporate
-  updated findings. Existing conclusions that are still supported by evidence
-  should be retained, not rewritten for the sake of rewriting.
-- **Phase 4 (Verification):** Run both audit sub-agents against the full
-  updated topic directory, not just the changed files. The auditors need the
-  complete picture to check consistency.
-- **Phase 5 (Index):** Update the `Last revised` date and `Dimensions` list
-  in `index.md`. Update the `Summary` if conclusions changed.
-
-### Step 6: Flag Adjacent Impact
-
-After the update is complete, review whether any findings materially affect
-adjacent research topics identified in Step 3. If so, report this to the user:
-
-- Which adjacent topic is affected
-- What specific finding creates the impact
-- Whether the impact changes conclusions or just adds supporting data
-
-**Do not update adjacent topics in this run.** Each adjacent topic update
-should be a separate invocation of the cited-research skill so that it receives
-full attention, full verification, and a clean context window. The user
-decides whether and when to run those updates.
+one, read `references/update-workflow.md` and follow its steps. The update
+workflow replaces Phase 0 and then feeds into Phases 1-5.
 
 ---
 
@@ -228,8 +135,9 @@ Exit plan mode only after the user approves.
    established reference sites > blogs/forums. When a secondary source quotes a
    number, try to find the original study.
 
-4. **Record everything immediately.** Note the URL, the specific claim, and the
-   exact wording from the source. Do not defer this.
+4. **Record everything immediately.** Research agents must include every URL,
+   claim, and exact source wording in their structured response. The main
+   thread cannot recover data that agents omit from their output.
 
 5. **Acknowledge gaps.** If a data point cannot be found after 3+ distinct
    queries, state explicitly that this data point is unavailable. Do not invent
@@ -239,13 +147,89 @@ Exit plan mode only after the user approves.
    not in the plan. Encourage this — unanticipated sources frequently strengthen
    the deliverable.
 
+### Coordinator Protocol
+
+Sub-agents cannot use WebFetch (no approval prompt in background) or Write
+(not allowlisted for arbitrary paths). The main thread handles all URL fetching
+and file writes. This preserves the security boundary where the user sees every
+outbound fetch before it happens.
+
+The research phase uses an iterative coordinator loop, capped at 3 iterations:
+
+```
+for each iteration (max 3):
+    1. Main thread dispatches agents with available context
+    2. Agents return structured results (findings + fetch requests)
+    3. Main thread WebFetches requested URLs (user approves)
+    4. If agents reported confidence > 0.8 with no new URLs: stop
+    5. Otherwise: feed fetched content back to agents for next iteration
+```
+
+**Iteration 1 — Discovery:**
+- Dispatch one `general-purpose` sub-agent per dimension with
+  `run_in_background: true`
+- Agent tools: WebSearch only (already works in background)
+- Agent returns: URL manifest, preliminary findings from search snippets,
+  confidence score, open questions
+- Use the **Research Agent — Discovery** template from
+  `references/sub-agent-prompts.md`
+- Main thread collects all URL manifests across agents
+
+**Iteration 2 — Deep read:**
+- Main thread batch-fetches all URLs from all manifests via WebFetch
+- When fetching fails, attempt WebSearch fallbacks before passing results
+  to agents — handle the 20-30% inaccessibility expectation at this layer
+- Dispatch agents again with fetched page content injected into the prompt
+- Use the **Research Agent — Analysis** template from
+  `references/sub-agent-prompts.md`
+- Agent returns: extracted data with citations, follow-up URL requests
+  (if any), updated confidence score
+
+**Iteration 3 — Gap-fill (conditional):**
+- Only runs if any agent reported confidence < 0.8 or requested follow-up
+  URLs after iteration 2
+- Main thread fetches follow-up URLs
+- Agents process remaining content, finalize findings
+- No further iterations regardless of confidence
+
+### Providing Fetched Content to Agents
+
+When the main thread fetches URLs for iteration 2+ or for the citation audit,
+write each page's extracted text to a temp directory at
+`/tmp/cited-research/<topic-slug>/` and pass the directory path to the agent
+prompt. Create the directory if it does not exist. This avoids bloating agent
+prompts with raw page content and lets agents read selectively via the Read
+tool. The temp directory is ephemeral — the OS handles cleanup.
+
+Each fetched file should have a header identifying the source:
+
+```
+# Fetched: <URL>
+# Date: <fetch timestamp>
+# Status: OK | FAILED (<reason>)
+
+<extracted text content>
+```
+
+For failed fetches, still create the file with the FAILED status so agents
+can see which URLs were inaccessible and report accordingly.
+
+### Convergence Criteria
+
+Stop iterating when:
+1. All agents report confidence > 0.8 **and** no agent requested follow-up
+   URLs, OR
+2. Iteration 3 completes (hard cap regardless of confidence)
+
+If any agent reports confidence < 0.5 after iteration 2, flag the dimension
+to the user as potentially under-sourced before proceeding to iteration 3.
+
 ### Structuring Research Agents
 
-Launch one `general-purpose` sub-agent per dimension, all in parallel via
-`run_in_background: true`. See `references/sub-agent-prompts.md` for the
-research agent prompt template.
+See `references/sub-agent-prompts.md` for two research agent prompt variants:
+**Discovery** (iteration 1) and **Analysis** (iteration 2+).
 
-The accountability line in the template ("a citation audit agent will
+The accountability line in both templates ("a citation audit agent will
 independently verify every claim you report") is functional, not decorative.
 Research agents that receive this instruction proactively flag source quality
 concerns, note when data comes from secondary citations, and explicitly report
@@ -261,10 +245,10 @@ report the full attribution chain.
 ### Expect Source Failures
 
 Expect **20-30% of sources to be inaccessible** (403 errors, permission denials,
-content mismatches). Plan for it:
+content mismatches). The main thread handles WebSearch fallbacks when URLs fail
+before passing results to agents. Plan for it:
 
 - Provide 2-3 candidate sources per data point when possible
-- Instruct research agents to attempt WebSearch fallbacks when URLs fail
 - Above 50% inaccessibility may indicate the topic lacks accessible web sources
   and the scope should be adjusted
 
@@ -362,6 +346,25 @@ After all files are written, launch **two independent review sub-agents in
 parallel**. These agents receive NO context from the research conversation —
 they read only the produced files. This isolation prevents confirmation bias.
 
+### Pre-Fetch for Citation Audit
+
+Before dispatching the Citation Audit agent, the main thread pre-fetches all
+cited URLs so the audit agent does not need WebFetch:
+
+1. Read `citations.md` and extract every cited URL
+2. Batch-fetch all URLs via WebFetch (the user approves once per batch)
+3. For URLs that fail, attempt WebSearch fallbacks from the main thread
+4. Write fetched content to `/tmp/cited-research/<topic-slug>/` files (same format as Phase 1)
+5. Dispatch the Citation Audit agent with the `/tmp/cited-research/<topic-slug>/` directory path —
+   the agent reads files via Read tool, it does not fetch URLs itself
+
+The audit agent receives **only** Read and Glob tools — do not give it WebFetch
+or WebSearch. All web access happens in the main thread before the agent runs.
+This ensures the audit runs against the same source content snapshot and avoids
+the sub-agent permission boundary.
+
+The Consistency Review agent also needs only Read and Glob.
+
 See `references/sub-agent-prompts.md` for both sub-agent prompt templates
 (Citation Audit and Consistency Review).
 
@@ -371,8 +374,9 @@ After both sub-agents complete:
 
 1. For INACCURATE or NOT FOUND citations: correct the claim in all files to
    match what the source actually says, or remove the claim and note the gap.
-2. For INACCESSIBLE sources: attempt alternative searches. If unsuccessful,
-   downgrade the claim to "unverified" with a note.
+2. For INACCESSIBLE sources: the main thread attempts alternative WebSearch
+   queries and re-fetches. If unsuccessful, downgrade the claim to "unverified"
+   with a note.
 3. For FAIL consistency checks: reconcile across all files — fix every file
    that references the incorrect value.
 4. If corrections are significant (>3 items), re-run the affected sub-agent.

@@ -2,62 +2,117 @@
 
 Copy and fill in the `[PLACEHOLDER]` values before dispatching each sub-agent.
 
-## Research Agent
+## Research Agent — Discovery (Iteration 1)
 
-Launch one per dimension via `Agent` tool with `run_in_background: true`.
+Launch one per dimension via `Agent` tool with `run_in_background: true`. Discovery
+agents use WebSearch to identify sources and build a URL manifest. They do not fetch
+full pages — the main thread handles that between iterations.
 
 ```
-You are researching [DIMENSION] for [PROJECT_DESCRIPTION]. Fetch data from
-these sources and extract ALL relevant [DATA_TYPE]. Be EXTREMELY precise —
-a citation audit agent will independently verify every claim you report.
+You are researching [DIMENSION] for [PROJECT_DESCRIPTION].
 
-Fetch these URLs and extract data:
-1. [URL] — [WHAT_TO_LOOK_FOR]
-2. [URL] — [WHAT_TO_LOOK_FOR]
-...
+Search for information about [DIMENSION] using these queries:
+[SEARCH_QUERIES]
 
-Also search for: "[SPECIFIC_SEARCH_QUERIES]"
+For each source you find, report:
+- The exact URL
+- A summary of what the page contains (from search snippets)
+- What specific data you expect to extract from the full page
+- Author/publication if visible in search results
+- Any caveats about source quality visible from the snippet
+
+Also report:
+- Confidence (0.0-1.0) that you have identified sufficient sources
+- Open questions that need further investigation
+- Any unexpected findings or dimensions worth exploring
+
+Return your findings in this structure:
+
+## URL Manifest
+| URL | Rationale | Data to extract |
+|-----|-----------|-----------------|
+| ... | ...       | ...             |
+
+## Preliminary Findings
+[Claims from search snippets, each marked (unverified)]
+
+## Confidence: [0.0-1.0]
+
+## Open Questions
+- [What still needs investigation]
+
+A citation audit agent will independently verify every claim in the final
+output. Report gaps and uncertainties — do not fill them with plausible
+guesses.
+```
+
+## Research Agent — Analysis (Iteration 2+)
+
+Dispatch after the main thread has fetched URLs from the discovery manifest.
+Analysis agents receive full page content in their prompt — they do not need
+WebFetch. Their job is to extract precise data from the provided content and
+flag any follow-up URLs discovered within it.
+
+```
+You are analyzing fetched content for [DIMENSION] of [PROJECT_DESCRIPTION].
+
+Fetched page content is available as files in [FETCHED_DIR]. Each file has a
+header with the source URL and fetch status. Read the files for the URLs you
+requested in your discovery manifest and extract ALL relevant [DATA_TYPE]
+with full precision.
 
 For each source, report:
-- The exact URL you successfully fetched
 - Complete extracted data (with units, sample sizes, conditions)
 - Direct quotes of key findings
 - Author names, publication year, title
 - Any caveats about data quality
 - The full attribution chain (who originally claimed what, through whom)
 
-If a URL doesn't work, try searching for the page and finding an alternative.
-Report failures clearly — do not silently drop sources.
+Also report:
+- Follow-up URLs discovered in this content that should be fetched
+  (only if they contain data not available in the provided content)
+- Updated confidence (0.0-1.0)
+- Remaining open questions
 
-Return ALL findings in structured format organized by source.
+If a provided page did not contain the expected data, state this explicitly.
+Do not silently drop sources or invent substitute data.
+
+A citation audit agent will independently verify every claim you report.
 ```
 
 ## Citation Audit Agent (Phase 4, Sub-Agent A)
 
-**Purpose:** Visit each cited URL and verify claims match actual source content.
-**Tools required:** Read, Glob, WebFetch, WebSearch
+**Purpose:** Verify claims against pre-fetched source content stored in `/tmp/cited-research/<topic-slug>/` files.
+**Tools required:** Read, Glob (no web access needed — content is pre-fetched)
+
+The main thread pre-fetches all cited URLs and writes them to `/tmp/cited-research/<topic-slug>/` files
+before dispatching this agent. The agent reads those files via the Read tool —
+it does not need WebFetch or WebSearch. This ensures every audit runs against
+the same snapshot of source content that the research used.
 
 ```
 You are a citation auditor. You have NO context from the research conversation
-that produced these files. Your job is SOURCE VERIFICATION — visit original
-source URLs and verify that claims match what the sources actually say.
+that produced these files. Your job is SOURCE VERIFICATION — compare claims
+in the documents against the actual source content.
 
 Read all markdown files in [DELIVERABLE_DIR] (including citations.md, all
 reference/*.md files, and the main deliverable).
 
-For each numbered citation:
+Pre-fetched source content is available as files in [FETCHED_DIR].
+Each file has a header with the source URL and fetch status. For each numbered
+citation:
 1. Read the claim as stated in the documents that cite it
 2. Find the corresponding URL in citations.md
-3. Visit the URL via WebFetch. If that fails, search for the page title
-   via WebSearch and try alternative URLs.
-4. Compare what the documents claim the source says vs. what it actually says
+3. Read the matching file in [FETCHED_DIR] for that URL's content
+4. Compare what the documents claim vs. what the source actually says
 5. Grade the citation:
    - VERIFIED: Source contains the claimed data, accurately represented
    - INACCURATE: Source exists but claim misrepresents it (explain how)
-   - INACCESSIBLE: URL did not resolve and WebSearch fallback failed
+   - INACCESSIBLE: Fetched file shows FAILED status
    - NOT FOUND: Source accessible but does not contain the claimed data
 
-Include the exact text from the source that supports or contradicts each claim.
+Include the exact text from the source that supports or contradicts each
+claim.
 
 Output format: a markdown file with a summary table, then one section per
 citation with grade, evidence, and notes. End with a count of each grade.
