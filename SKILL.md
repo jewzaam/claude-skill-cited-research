@@ -22,6 +22,39 @@ This skill exists because LLMs hallucinate. The methodology makes hallucination
 structurally difficult by separating research, writing, and verification into
 distinct phases — and by making the writing phase aware that verification follows.
 
+## Output Location
+
+Before starting any research, determine where the output will be written.
+
+### Detecting the `cited-research` repo
+
+Check whether the current working directory is inside a git repository whose
+root directory is named `cited-research`. Use `git rev-parse --show-toplevel`
+and inspect the basename of the result.
+
+- **Inside `cited-research`**: This is the dedicated research monorepo. Use
+  the repo root as the output location. Each research topic gets its own
+  directory under `research/` (e.g., `research/queue-system-comparison/`,
+  `research/clarinet-vs-french-horn/`). The topic directory name should be a
+  short, kebab-case slug derived from the research subject.
+
+- **Not inside `cited-research`**: Default to the current repo root as
+  `<root>`. Use the same `research/<topic-slug>/` structure. If the user
+  wants a different location, they will say so.
+
+### Repo-level files (cited-research only)
+
+The `cited-research` repo maintains two root-level files:
+
+- **`README.md`** — Explains what the repository is (a monorepo of
+  citation-backed research documents) and how it is organized. This is NOT an
+  index of topics. Create it on the first research run if it does not exist.
+
+- **`index.md`** — A searchable index of all research topics. Each entry is
+  a record that both humans and LLMs can scan quickly. See
+  [Phase 5: Index Maintenance](#phase-5-index-maintenance-cited-research-repo-only)
+  for format and update rules.
+
 ## Phase 0: Plan Mode (Required)
 
 Enter plan mode before doing any research. The plan is the contract between you
@@ -38,24 +71,30 @@ user may add dimensions you didn't consider or remove ones they find out of scop
 
 ### Step 2: Plan the File Structure
 
-Once dimensions are approved, define the output file tree:
+Once dimensions are approved, define the output file tree. The structure
+depends on where the output is going.
+
+The topic directory structure is the same regardless of output location:
 
 ```
-<project-root>/
+research/<topic-slug>/
 ├── README.md                     # Short standalone summary (TL;DR + key tables)
-└── docs/
-    ├── <deliverable>.md          # Full analysis with methodology
-    ├── citations.md              # All sources, numbered
-    ├── reference/
-    │   ├── <dimension-1>.md      # One file per approved dimension
-    │   └── ...
-    └── audit/
-        ├── citation-audit.md
-        └── consistency-review.md
+├── <deliverable>.md              # Full analysis with methodology
+├── citations.md                  # All sources, numbered
+├── references/
+│   ├── <dimension-1>.md          # One file per approved dimension
+│   └── ...
+└── audit/
+    ├── citation-audit.md
+    └── consistency-review.md
 ```
 
-Use a `docs/` directory from the start — projects outgrow flat structures.
-The README is written last as a standalone decision-making tool.
+The README inside each topic directory is written last as a standalone
+decision-making tool.
+
+If a topic directory already exists (e.g., a prior research run on the same
+subject), ask the user whether to revise the existing topic in place or
+create a new directory with a disambiguating slug.
 
 ### Step 3: Plan Data Points as Hypotheses
 
@@ -145,11 +184,11 @@ principles: number sequentially, include the specific data extracted (not just
 "useful article"), flag source quality concerns, and mark retracted sources
 rather than deleting them (keeps citation numbers stable).
 
-### Building `reference/<topic>.md`
+### Building `references/<topic>.md`
 
 Each reference file should:
 - State what dimension it covers
-- Link to `../citations.md` for source details
+- Link to [`citations.md`](../citations.md) for source details
 - Present data in tables where possible (easier to audit)
 - Quote sources directly when precision matters
 - Cite every fact with `[N]`
@@ -195,6 +234,12 @@ methodology. The review agents catch errors before the user relies on the output
 6. **Cross-file consistency is your responsibility.** Verify every number in
    the deliverable matches the corresponding reference file before finalizing.
 
+7. **Use relative links between files.** When referencing another file in the
+   topic directory (e.g., citations.md, a reference file, the README), use a
+   markdown link (`[citations](citations.md)`) rather than just naming the
+   file. This makes the documents navigable in any markdown viewer or when
+   rendered as HTML.
+
 ### Writing the README
 
 The README is written last. It distills the deliverable into:
@@ -202,9 +247,9 @@ The README is written last. It distills the deliverable into:
 - One-paragraph summary of what the document answers
 - The key table or result
 - A quick decision framework (3-5 steps)
-- Links to `docs/` for full methodology
+- Links to the supporting files for full methodology
 
-It should stand alone — a reader who never opens `docs/` still gets an
+It should stand alone — a reader who never opens the supporting files still gets an
 actionable answer.
 
 ## Phase 4: Verification
@@ -262,3 +307,41 @@ The non-negotiable elements at every scale:
 2. URLs are recorded
 3. Writing and verification are separate steps
 4. The writer knows verification will happen
+
+## Phase 5: Index Maintenance (cited-research repo only)
+
+Skip this phase when output is not in the `cited-research` repo.
+
+After Phase 4 verification is complete and all corrections are applied, update
+`index.md` at the repo root. If the file does not exist, create it with a
+brief header explaining its purpose.
+
+### Index entry format
+
+Each entry is a block that can be parsed by both humans scanning the page and
+an LLM searching for relevant prior research:
+
+```markdown
+## <Topic Title>
+
+**Path:** `research/<topic-slug>/`
+**Summary:** <One or two sentences describing what was researched and the key finding or conclusion.>
+**Dimensions:** <comma-separated list of the research dimensions covered>
+**Last revised:** <YYYY-MM-DD>
+**Status:** Active
+```
+
+- **Topic Title** matches the README title inside the topic directory.
+- **Summary** should be specific enough that someone can decide whether to
+  read further without opening the topic directory.
+- **Dimensions** are the approved dimensions from Phase 0. These are the
+  primary search surface for discovering relevant prior work.
+- **Last revised** is the date when this phase runs. Use the output of
+  `date +%Y-%m-%d` — precision beyond the day is not important.
+  Update this field on every revision to the topic.
+- **Status** is `Active` for current research. If a topic is later superseded
+  or abandoned, update to `Superseded by <other-slug>` or `Archived`.
+
+Append new entries at the end of the file. Do not re-sort — chronological
+order by creation is the simplest convention and git history tracks everything
+else.
