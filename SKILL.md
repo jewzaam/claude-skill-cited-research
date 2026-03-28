@@ -324,11 +324,11 @@ an LLM searching for relevant prior research:
 ```markdown
 ## <Topic Title>
 
-**Path:** `research/<topic-slug>/`
-**Summary:** <One or two sentences describing what was researched and the key finding or conclusion.>
-**Dimensions:** <comma-separated list of the research dimensions covered>
-**Last revised:** <YYYY-MM-DD>
-**Status:** Active
+- **Path:** `research/<topic-slug>/`
+- **Summary:** <One or two sentences describing what was researched and the key finding or conclusion.>
+- **Dimensions:** <comma-separated list of the research dimensions covered>
+- **Last revised:** <YYYY-MM-DD>
+- **Status:** Active
 ```
 
 - **Topic Title** matches the README title inside the topic directory.
