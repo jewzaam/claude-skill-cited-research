@@ -31,19 +31,33 @@ Before starting any research, determine where the output will be written.
 
 ### Detecting the `cited-research` repo
 
-Check whether the current working directory is inside a git repository whose
-root directory is named `cited-research`. Use `git rev-parse --show-toplevel`
-and inspect the basename of the result.
+Run this exact sequence to determine whether you are inside the dedicated
+research monorepo:
 
-- **Inside `cited-research`**: This is the dedicated research monorepo. Use
-  the repo root as the output location. Each research topic gets its own
+1. Run `git rev-parse --show-toplevel` — this prints the absolute path of
+   the repository root (e.g., `/home/user/source/cited-research`).
+2. Run `basename <that path>` — this prints the last path component, which
+   is the repo name (e.g., `cited-research`).
+3. Compare that repo name to the exact string `cited-research`.
+
+These are two separate commands — do not combine them with `$()` or
+backticks. Command substitution triggers additional user approval prompts
+in Claude Code. Read the output of step 1, then pass it to step 2.
+
+**Do not** use `pwd`, the remote URL, the presence of specific files, or
+any other method. The only correct check is: `basename` of the path from
+`git rev-parse --show-toplevel` equals `cited-research`.
+
+- **Repo name is `cited-research`**: This is the dedicated research monorepo.
+  Use the repo root as the output location. Each research topic gets its own
   directory under `research/` (e.g., `research/queue-system-comparison/`,
   `research/clarinet-vs-french-horn/`). The topic directory name should be a
   short, kebab-case slug derived from the research subject.
 
-- **Not inside `cited-research`**: Default to the current repo root as
-  `<root>`. Use the same `research/<topic-slug>/` structure. If the user
-  wants a different location, they will say so.
+- **Repo name is anything else** (including `claude-skill-cited-research`,
+  which is the skill source repo, not the research monorepo): Default to the
+  current repo root as `<root>`. Use the same `research/<topic-slug>/`
+  structure. If the user wants a different location, they will say so.
 
 ### Repo-level files (cited-research only)
 
@@ -197,9 +211,13 @@ for each iteration (max 3):
 When the main thread fetches URLs for iteration 2+ or for the citation audit,
 write each page's extracted text to a temp directory at
 `/tmp/cited-research/<topic-slug>/` and pass the directory path to the agent
-prompt. Create the directory if it does not exist. This avoids bloating agent
-prompts with raw page content and lets agents read selectively via the Read
-tool. The temp directory is ephemeral — the OS handles cleanup.
+prompt. Create the directory with `mkdir -p` if it does not exist. This avoids
+bloating agent prompts with raw page content and lets agents read selectively
+via the Read tool. The temp directory is ephemeral — the OS handles cleanup.
+
+**Use the Write tool** to create each fetched-content file. Do not use `cat`,
+`echo`, heredocs, or any other Bash command to write files. Every Bash write
+command requires a separate user approval prompt — the Write tool does not.
 
 Each fetched file should have a header identifying the source:
 
