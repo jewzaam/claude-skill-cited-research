@@ -5,9 +5,12 @@ one, follow this workflow. It replaces Phase 0 and then feeds into Phases 1-5.
 
 ## Step 1: Identify the Target Topic
 
-If the current working directory is inside the `cited-research` repo, read
-`index.md` to get the list of existing topics. Ask the user which topic to
-update — they can specify by:
+Determine whether you are in the `cited-research` repo using the detection
+method from SKILL.md (last path component of `git rev-parse --show-toplevel`
+equals exactly `cited-research`).
+
+If inside the `cited-research` repo, read `index.md` to get the list of
+existing topics. Ask the user which topic to update — they can specify by:
 - Directory path (e.g., `research/security-skills/`)
 - Topic name as it appears in `index.md`
 - A description that you match against index entries
