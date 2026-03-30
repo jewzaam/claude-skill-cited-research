@@ -19,7 +19,16 @@ For each source you find, report:
 - A summary of what the page contains (from search snippets)
 - What specific data you expect to extract from the full page
 - Author/publication if visible in search results
+- Source quality tier:
+  - Tier 1: Peer-reviewed paper, government/institutional report
+  - Tier 2: Manufacturer spec, established reference site, university publication
+  - Tier 3: Industry blog, conference talk, well-known practitioner
+  - Tier 4: Forum, personal blog, GitHub discussion, social media
 - Any caveats about source quality visible from the snippet
+
+For each key data point, identify 2-3 candidate sources when possible.
+20-30% of sources will be inaccessible — redundant candidates prevent
+single points of failure.
 
 Also report:
 - Confidence (0.0-1.0) that you have identified sufficient sources
@@ -105,11 +114,20 @@ citation:
 2. Find the corresponding URL in citations.md
 3. Read the matching file in [FETCHED_DIR] for that URL's content
 4. Compare what the documents claim vs. what the source actually says
-5. Grade the citation:
-   - VERIFIED: Source contains the claimed data, accurately represented
+5. Grade the citation — check whether the source *entails* the claim,
+   not just whether the source mentions the topic:
+   - VERIFIED: Source directly supports the specific claim as stated
+   - PARTIAL: Source addresses the topic but does not directly support the
+     specific claim — the claim goes beyond what the source actually says,
+     or the source is tangentially related but doesn't entail the assertion
    - INACCURATE: Source exists but claim misrepresents it (explain how)
    - INACCESSIBLE: Fetched file shows FAILED status
    - NOT FOUND: Source accessible but does not contain the claimed data
+
+The PARTIAL grade is where subtle misrepresentation hides. A source that
+mentions "AI hallucination" does not automatically support a specific
+hallucination rate claim. Check that the source entails the specific
+assertion, not just the general topic.
 
 Include the exact text from the source that supports or contradicts each
 claim.
@@ -144,10 +162,13 @@ Check:
 4. COMPLETENESS: Every factual claim in the summary should trace to a
    reference file and a citation. Flag orphan claims.
 5. CONTRADICTION CHECK: No two files should state conflicting facts.
-6. ESTIMATION MARKERS: All interpolated or derived values should be flagged
+6. CONTRADICTION TRANSPARENCY: When sources disagree, is the disagreement
+   surfaced explicitly with citations to both sides? Or has one interpretation
+   been silently selected? Suppressed contradictions are a critical finding.
+7. ESTIMATION MARKERS: All interpolated or derived values should be flagged
    with "(est.)" or "Calculated from [N] and [M]". Flag unmarked estimates.
-7. CAVEAT HONESTY: Are limitations and gaps stated clearly?
-8. CROSS-REFERENCE LINKS: Do internal markdown links resolve correctly
+8. CAVEAT HONESTY: Are limitations and gaps stated clearly?
+9. CROSS-REFERENCE LINKS: Do internal markdown links resolve correctly
    given the directory structure?
 
 Output format: a markdown file with a summary table of issues found

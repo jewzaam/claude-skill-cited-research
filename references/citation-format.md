@@ -7,8 +7,19 @@
 *Publication Name*, vol. X, article/issue Y, YEAR.
 DOI: 10.xxxx/xxxxx.
 <https://full-url-here>
+**Tier:** 1
 Brief description of specific data extracted (with units, sample sizes).
 ```
+
+### Source Quality Tiers
+
+- **Tier 1:** Peer-reviewed papers, government/institutional reports
+- **Tier 2:** Manufacturer specs, established reference sites, university publications
+- **Tier 3:** Industry blogs, conference talks, well-known practitioners
+- **Tier 4:** Forums, personal blogs, GitHub discussions, social media
+
+The tier helps readers and audit agents quickly assess source reliability.
+When sources conflict, higher-tier sources take precedence by default.
 
 ## Entry with Quality Flag
 
