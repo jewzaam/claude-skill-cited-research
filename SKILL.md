@@ -128,6 +128,13 @@ to verify**, not commitments. Research agents must report what they actually fin
 even when it contradicts the plan. Dropped or corrected claims are a sign the
 methodology is working, not failing.
 
+For each key data point, identify **2-3 candidate sources** rather than relying
+on a single source. This is not redundancy for its own sake — 20-30% of web
+sources are inaccessible at any given time due to link rot, paywalls, and AI
+crawler blocking (see `references/research-basis.md` §Source Inaccessibility).
+Planning for multiple candidates per data point shifts inaccessibility handling
+from reactive fallback to proactive coverage.
+
 ### Step 4: Get Plan Approval
 
 The plan should include: dimensions, file structure, the deliverable's intended
@@ -145,19 +152,35 @@ Exit plan mode only after the user approves.
    group of related dimensions). Four agents in parallel take the same wall-clock
    time as one.
 
-3. **Primary sources preferred.** Peer-reviewed papers > manufacturer specs >
-   established reference sites > blogs/forums. When a secondary source quotes a
-   number, try to find the original study.
+3. **Primary sources preferred.** Assign quality tiers to sources and prefer
+   higher tiers when conflicts arise:
+   - **Tier 1:** Peer-reviewed papers, government/institutional reports
+   - **Tier 2:** Manufacturer specs, established reference sites, university
+     publications
+   - **Tier 3:** Industry blogs, conference talks, well-known practitioners
+   - **Tier 4:** Forums, personal blogs, GitHub discussions, social media
 
-4. **Record everything immediately.** Research agents must include every URL,
+   When a secondary source quotes a number, try to find the original study.
+   See `references/research-basis.md` §Source Quality and Weighting for the
+   evidence behind these tiers.
+
+4. **Consider source recency relative to topic.** For fast-moving domains
+   (for example AI, cloud infrastructure, security), prefer sources published within the
+   last 2 years — the landscape changes quickly enough that older findings may
+   be superseded. For stable domains (for example physics, music theory, established
+   engineering, mathematics), older sources are often authoritative.
+   When mixing source ages, note the publication year alongside each claim so
+   readers can assess currency.
+
+5. **Record everything immediately.** Research agents must include every URL,
    claim, and exact source wording in their structured response. The main
    thread cannot recover data that agents omit from their output.
 
-5. **Acknowledge gaps.** If a data point cannot be found after 3+ distinct
+6. **Acknowledge gaps.** If a data point cannot be found after 3+ distinct
    queries, state explicitly that this data point is unavailable. Do not invent
    a plausible number.
 
-6. **Welcome bonus sources.** Research agents often discover relevant sources
+7. **Welcome bonus sources.** Research agents often discover relevant sources
    not in the plan. Encourage this — unanticipated sources frequently strengthen
    the deliverable.
 
@@ -179,9 +202,23 @@ for each iteration (max 3):
     5. Otherwise: feed fetched content back to agents for next iteration
 ```
 
+### Model Assignment
+
+Specify the `model` parameter in Agent tool calls based on agent role.
+Verification is structurally easier than generation — lighter models handle
+mechanical tasks well, while synthesis and reasoning benefit from heavier
+models (see `references/research-basis.md` §Model Assignment by Agent Role).
+
+| Agent Role | Model | Rationale |
+|---|---|---|
+| Research — Discovery | `sonnet` | Search query generation is mechanical |
+| Research — Analysis | `opus` | Deep extraction and synthesis |
+| Citation Audit | `sonnet` | Claim-vs-source comparison |
+| Consistency Review | `sonnet` | Cross-file numerical checking |
+
 **Iteration 1 — Discovery:**
 - Dispatch one `general-purpose` sub-agent per dimension with
-  `run_in_background: true`
+  `run_in_background: true` and `model: "sonnet"`
 - Agent tools: WebSearch only (already works in background)
 - Agent returns: URL manifest, preliminary findings from search snippets,
   confidence score, open questions
@@ -193,11 +230,24 @@ for each iteration (max 3):
 - Main thread batch-fetches all URLs from all manifests via WebFetch
 - When fetching fails, attempt WebSearch fallbacks before passing results
   to agents — handle the 20-30% inaccessibility expectation at this layer
-- Dispatch agents again with fetched page content injected into the prompt
+- Dispatch agents again with `model: "opus"` and fetched page content
+  injected into the prompt
 - Use the **Research Agent — Analysis** template from
   `references/sub-agent-prompts.md`
 - Agent returns: extracted data with citations, follow-up URL requests
   (if any), updated confidence score
+
+**Source triage (between iteration 2 and 3):**
+
+After iteration 2, review the fetch results for high-priority sources that
+failed. If any Tier 1-2 sources (peer-reviewed, institutional, government)
+were inaccessible and the data they were expected to provide feeds into key
+claims or calculations, present them to the user before proceeding. Users
+often have institutional access, cached copies, or bookmarks that resolve
+sources agents cannot reach. If the user provides content, write it to the
+temp directory and include it in the next iteration's agent prompts.
+
+See `references/research-basis.md` §Source Triage as Human Gate for evidence.
 
 **Iteration 3 — Gap-fill (conditional):**
 - Only runs if any agent reported confidence < 0.8 or requested follow-up
@@ -247,11 +297,14 @@ to the user as potentially under-sourced before proceeding to iteration 3.
 See `references/sub-agent-prompts.md` for two research agent prompt variants:
 **Discovery** (iteration 1) and **Analysis** (iteration 2+).
 
-The accountability line in both templates ("a citation audit agent will
-independently verify every claim you report") is functional, not decorative.
-Research agents that receive this instruction proactively flag source quality
-concerns, note when data comes from secondary citations, and explicitly report
-when expected data points are absent.
+Both templates include an accountability line ("a citation audit agent will
+independently verify every claim you report"). The behavioral effect of this
+line on LLM output is plausible but unvalidated by published research. The
+real enforcement mechanism is structural: requiring inline citations forces
+a model to fabricate both a false claim AND a false citation simultaneously
+(the "dual-error" principle), making fabrication harder. The accountability
+line reinforces the inline citation requirement. See
+`references/research-basis.md` §Accountability Clause for evidence.
 
 ### Capture Provenance, Not Just Data
 
@@ -263,12 +316,11 @@ report the full attribution chain.
 ### Expect Source Failures
 
 Expect **20-30% of sources to be inaccessible** (403 errors, permission denials,
-content mismatches). The main thread handles WebSearch fallbacks when URLs fail
-before passing results to agents. Plan for it:
-
-- Provide 2-3 candidate sources per data point when possible
-- Above 50% inaccessibility may indicate the topic lacks accessible web sources
-  and the scope should be adjusted
+content mismatches, AI crawler blocking). The main thread handles WebSearch
+fallbacks when URLs fail before passing results to agents. The 2-3 candidate
+sources per data point planned in Phase 0 Step 3 provide the redundancy needed
+to absorb this failure rate. Above 50% inaccessibility may indicate the topic
+lacks accessible web sources and the scope should be adjusted.
 
 When PDFs fail to extract, search for the paper's title plus the specific data
 point needed, check PubMed abstracts, or look for citing secondary sources.
@@ -312,10 +364,12 @@ Each reference file should:
 
 ### The Accountability Clause
 
-Before writing, internalize this: **Two independent review agents will audit
-this document.** One visits every cited URL. The other checks numerical and
-logical consistency across all files. This is not a threat — it is the
-methodology. The review agents catch errors before the user relies on the output.
+Two independent review agents will audit this document — one checks every
+cited URL against source content, the other checks numerical and logical
+consistency. The real protection is structural: every claim requires an inline
+citation, and fabricating both a false claim and a matching false citation is
+harder than fabricating either alone (the "dual-error" principle). The review
+step catches what slips through.
 
 ### Writing Rules
 
@@ -334,17 +388,30 @@ methodology. The review agents catch errors before the user relies on the output
 4. **Do not round aggressively.** If the source says 2.7, write 2.7, not
    "about 3." Rounding obscures precision and makes audit harder.
 
-5. **State limitations prominently.** The user trusts you more when you show
+5. **Surface contradictions, don't suppress them.** When sources disagree,
+   state the disagreement explicitly with citations to both sides. Do not
+   silently select one interpretation — the reader needs to see the conflict
+   to assess which source to trust. See `references/research-basis.md`
+   §Contradiction Transparency.
+
+6. **State limitations prominently.** The user trusts you more when you show
    what you don't know.
 
-6. **Cross-file consistency is your responsibility.** Verify every number in
+7. **Cross-file consistency is your responsibility.** Verify every number in
    the deliverable matches the corresponding reference file before finalizing.
 
-7. **Use relative links between files.** When referencing another file in the
+8. **Use relative links between files.** When referencing another file in the
    topic directory (e.g., citations.md, a reference file, the README), use a
    markdown link (`[citations](citations.md)`) rather than just naming the
    file. This makes the documents navigable in any markdown viewer or when
    rendered as HTML.
+
+9. **Review cross-source synthesis carefully.** Claims that draw on multiple
+   sources for a single conclusion are where LLMs are weakest — individual
+   document analysis is strong, but narrative integration across papers is a
+   documented limitation (see `references/research-basis.md` §Cross-Source
+   Synthesis Limitation). Flag cross-document claims for operator review when
+   they underpin key conclusions.
 
 ### Writing the README
 
@@ -361,8 +428,11 @@ actionable answer.
 ## Phase 4: Verification
 
 After all files are written, launch **two independent review sub-agents in
-parallel**. These agents receive NO context from the research conversation —
-they read only the produced files. This isolation prevents confirmation bias.
+parallel** with `model: "sonnet"`. These agents receive NO context from the
+research conversation — they read only the produced files. This isolation
+prevents confirmation bias. Sonnet is sufficient for verification tasks, which
+are structurally easier than generation (see `references/research-basis.md`
+§Model Assignment by Agent Role).
 
 ### Pre-Fetch for Citation Audit
 
@@ -406,9 +476,10 @@ Present the verification summary to the user along with the deliverable.
 
 ### Resolving Inaccessible Sources — Ask the User
 
-When sources remain inaccessible after fallbacks, ask the user for help before
-marking claims as permanently unverified. Users often have cached copies,
-institutional access, or browser bookmarks. Prioritize asking about sources
+High-priority inaccessible sources (Tier 1-2) should already have been
+triaged with the user between iterations 2 and 3 (see Phase 1). For any
+remaining inaccessible sources discovered during verification, ask the user
+for help before marking claims as permanently unverified. Prioritize sources
 with quantitative claims that feed into calculations or conclusions.
 
 ### Re-Verification on Revisit

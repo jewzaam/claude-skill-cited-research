@@ -74,6 +74,16 @@ For approved dimensions, proceed through Phases 1-5 with these modifications:
   refresh-citations dimensions, scope the discovery agent to: verify
   accessibility of existing sources, check whether cited data has been updated
   or superseded, and search for recent developments.
+
+  **Content drift detection:** For refresh-citations dimensions, re-fetch each
+  existing source and compare the fetched content against the "Brief description
+  of specific data extracted" recorded in `citations.md`. Flag cases where the
+  page is accessible but the originally cited data is no longer present or has
+  changed materially. A URL that resolves but no longer contains the cited data
+  is functionally equivalent to a broken link. Research shows 13% of intact
+  links exhibit significant content drift (see the skill's
+  `references/research-basis.md` §Content Drift Detection for evidence).
+  Report drift findings to the user as part of the update scope review.
 - **Phase 2 (Organization):** Update `citations.md` incrementally — append new
   sources with the next sequential number. Do not renumber existing citations.
   Update affected `references/*.md` files. Create new reference files for new
