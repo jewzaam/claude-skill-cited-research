@@ -49,6 +49,28 @@ DOI: 10.xxxx/xxxxx.
 Originally cited for: [what it was supposed to support].
 ```
 
+## Retraction Ledger Format
+
+When the update workflow removes claims due to lost citation support, record
+each removal in `retraction-log.md` in the topic directory. Each entry
+documents what was removed and why, providing an audit trail beyond git
+history.
+
+```markdown
+## <ISO-8601 timestamp>
+
+- **Removed claim:** "<exact text of the removed claim>"
+- **Failed citation:** [N] Author, Year, <URL>
+- **Reason:** <one of: URL returns 404 | Content drift — originally cited
+  data no longer present | Source explicitly retracted | User confirmed
+  material drift>
+- **Discovery pass:** <whether the update's discovery agents found
+  replacement sources — yes/no>
+```
+
+If no claims are removed during an update run, do not create or modify the
+retraction ledger.
+
 ## Rules
 
 1. **Number sequentially.** Do not skip numbers.
