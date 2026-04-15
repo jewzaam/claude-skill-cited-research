@@ -75,15 +75,44 @@ For approved dimensions, proceed through Phases 1-5 with these modifications:
   accessibility of existing sources, check whether cited data has been updated
   or superseded, and search for recent developments.
 
-  **Content drift detection:** For refresh-citations dimensions, re-fetch each
-  existing source and compare the fetched content against the "Brief description
-  of specific data extracted" recorded in `citations.md`. Flag cases where the
-  page is accessible but the originally cited data is no longer present or has
-  changed materially. A URL that resolves but no longer contains the cited data
-  is functionally equivalent to a broken link. Research shows 13% of intact
-  links exhibit significant content drift (see the skill's
-  `references/research-basis.md` §Content Drift Detection for evidence).
-  Report drift findings to the user as part of the update scope review.
+  **Fresh re-fetch (all update types):** Re-fetch every cited URL for the
+  dimensions in scope. Do not trust cached extractions — sources 404, drift,
+  or get retracted over time. 90% of retracted papers continue being cited
+  [§Retracted Citation Persistence in `references/research-basis.md`].
+
+  The re-fetch sequence:
+  1. Run discovery for new sources (standard discovery agents)
+  2. Collect the combined URL set: existing citation URLs for in-scope
+     dimensions + newly discovered URLs
+  3. Deduplicate by exact URL
+  4. Fetch the full set via WebFetch (user approves)
+  5. Compare fetched content against the "Brief description of specific data
+     extracted" recorded in `citations.md` to detect content drift
+
+  **Content drift handling:** For each re-fetched source, classify the result:
+  - **OK:** Content matches the original extraction description
+  - **404/gone:** URL no longer resolves
+  - **Drift:** Page loads but the cited data is no longer present or has
+    changed materially. A URL that resolves but no longer contains the cited
+    data is functionally equivalent to a broken link. Research shows 13% of
+    intact links exhibit significant content drift (see
+    `references/research-basis.md` §Content Drift Detection)
+  - **Retracted:** Source explicitly marked as retracted or withdrawn
+
+  For drift cases, present the specific change to the user with the original
+  extraction description and the current content. The user decides whether
+  drift is material enough to warrant claim removal.
+
+  **Claim removal:** Claims that lose all citation support (404, retraction,
+  or user-confirmed material drift) are removed from the updated deliverable.
+  Do not attempt to re-research a failing citation to rescue an existing
+  claim — that reintroduces a "this claim must be true" bias. If the claim
+  is still accurate, discovery agents will find fresh sources for it
+  independently.
+
+  **Retraction ledger:** Write removed claims to `retraction-log.md` in the
+  topic directory. See `references/citation-format.md` §Retraction Ledger
+  Format for the entry format. Git history serves as a secondary audit trail.
 - **Phase 2 (Organization):** Update `citations.md` incrementally — append new
   sources with the next sequential number. Do not renumber existing citations.
   Update affected `references/*.md` files. Create new reference files for new

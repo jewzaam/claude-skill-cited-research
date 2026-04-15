@@ -94,6 +94,29 @@ Include both directly requested dimensions and recommended additions that would
 strengthen the analysis. Explain why each recommended dimension adds value. The
 user may add dimensions you didn't consider or remove ones they find out of scope.
 
+### Step 1b: Framing Challenge
+
+Before finalizing the dimension list, surface the assumptions embedded in
+the user's question. State:
+
+- What conclusion the question implicitly assumes
+- What frame of reference it adopts (and what alternatives it excludes)
+- What the question does not ask that it probably should
+
+Present this to the user alongside the proposed dimensions. The user can
+accept the framing, adjust it, or add dimensions that address blind spots.
+
+This is harm reduction, not elimination — the coordinator is an LLM reading
+the user's prompt, so the framing challenge itself reflects the same biases
+it aims to surface. Expert-opinion anchoring has zero exceptions across
+tested LLMs [§Framing Challenge in `references/research-basis.md`]. The
+value is in making the assumptions visible rather than invisible.
+
+Keep it concise: one to three bullet points per assumption. Do not produce
+a verbose "framing audit" — if the challenge is noisy, the user will ignore
+it. For neutral technical questions (e.g., "how does async work in Python?"),
+the challenge may be empty or minimal; that is a valid outcome.
+
 ### Step 2: Plan the File Structure
 
 Once dimensions are approved, define the output file tree. The structure
@@ -135,10 +158,27 @@ crawler blocking (see `references/research-basis.md` §Source Inaccessibility).
 Planning for multiple candidates per data point shifts inaccessibility handling
 from reactive fallback to proactive coverage.
 
-### Step 4: Get Plan Approval
+### Step 4: Counter-perspective Handling
+
+Before finalizing the plan, ask the user how to handle counter-perspectives
+during research. Present three options:
+
+1. **Find and include** (default) — search for counter-perspectives alongside
+   supporting evidence. Whatever is found merges into the citation pool.
+2. **Find and gate** — search for counter-perspectives; if few or none are
+   found, pause and surface this to the user before proceeding.
+3. **Skip** — do not search for counter-perspectives. Appropriate for purely
+   technical topics (e.g., "how does X work?") where counter-perspectives
+   are unlikely to exist.
+
+The user's choice governs whether Counter-Discovery agents are dispatched
+in Phase 1 and how null results are handled.
+
+### Step 5: Get Plan Approval
 
 The plan should include: dimensions, file structure, the deliverable's intended
-structure, and a note that two independent review agents will audit the output.
+structure, counter-perspective handling choice, and a note that two independent
+review agents will audit the output.
 Exit plan mode only after the user approves.
 
 ## Phase 1: Research
@@ -224,7 +264,31 @@ models (see `references/research-basis.md` §Model Assignment by Agent Role).
   confidence score, open questions
 - Use the **Research Agent — Discovery** template from
   `references/sub-agent-prompts.md`
-- Main thread collects all URL manifests across agents
+- **Counter-Discovery** (unless user chose "Skip" in Phase 0 Step 4):
+  dispatch one Counter-Discovery agent per dimension alongside the
+  Discovery agent, also with `run_in_background: true` and `model: "sonnet"`.
+  Use the **Research Agent — Counter-Discovery** template. Counter-Discovery
+  agents seek contradicting evidence, failure cases, and minority viewpoints.
+  Their URLs merge into the same manifest pool — no tagging distinguishes
+  counter-sources from supporting sources. If the user chose "Find and gate"
+  and a Counter-Discovery agent returns confidence < 0.3 with no URLs,
+  surface this to the user before proceeding to iteration 2
+- Main thread collects all URL manifests across all agents (Discovery +
+  Counter-Discovery)
+
+**Multi-engine augmentation (between iterations 1 and 2):**
+- After collecting discovery agent URL manifests, the coordinator runs
+  `scripts/multi-search.py` for each dimension's top search queries to
+  pull results from DuckDuckGo (and any additional engines configured).
+  Run the script via: `python -m scripts.multi-search --query "..." --limit 10`
+- Merge the script's URLs into the URL manifest pool alongside the
+  agents' WebSearch results
+- Deduplicate the combined pool by exact URL before fetching
+- 84.9% of search results are unique to a single engine [§Multi-Engine
+  Search Diversity in `references/research-basis.md`] — this step
+  structurally reduces single-engine bias in the citation pool
+- The coordinator invokes the script, not the sub-agents. This preserves
+  the security boundary where the user sees every outbound action
 
 **Iteration 2 — Deep read:**
 - Main thread batch-fetches all URLs from all manifests via WebFetch
@@ -412,6 +476,21 @@ step catches what slips through.
    documented limitation (see `references/research-basis.md` §Cross-Source
    Synthesis Limitation). Flag cross-document claims for operator review when
    they underpin key conclusions.
+
+### Reflection Before Finalizing
+
+After assembling the draft deliverable and before writing the README,
+perform one reflection pass. Ask yourself:
+
+> Is there anything I overlooked, a claim I stated with more confidence
+> than the source supports, an alternative interpretation I dismissed, or
+> a contradiction I suppressed? Revise accordingly.
+
+This is a single pass, not a chain-of-thought expansion. LLM self-correction
+fails 64.5% of the time, but a single reflection prompt reduces that
+blind-spot rate by 89.3% [§Self-reflection Intervention in
+`references/research-basis.md`]. Keep it to one turn to preserve the
+"fast thinking" design principle.
 
 ### Writing the README
 
