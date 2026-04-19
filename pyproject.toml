@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "claude-skill-cited-research"
+version = "0.1.0"
+description = "Source repository for the cited-research Claude Code skill"
+readme = "README.md"
+requires-python = ">=3.12"
+license = {file = "LICENSE"}
+authors = [
+    {name = "Naveen Malik"}
+]
+dependencies = [
+    "ddgs>=9.0,<10.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+    "pytest-mock>=3.0",
+    "black>=23.0",
+    "flake8>=6.0",
+    "mypy==1.11.2",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["scripts*"]
+
+[tool.pytest.ini_options]
+markers = [
+    "live: hits real network (deselected by default; run with `make test-live`)",
+]
+addopts = "-m 'not live'"
+
+[tool.mypy]
+ignore_missing_imports = true

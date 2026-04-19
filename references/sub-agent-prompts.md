@@ -161,10 +161,10 @@ A citation audit agent will independently verify every claim you report.
 
 ## Citation Audit Agent (Phase 4, Sub-Agent A)
 
-**Purpose:** Verify claims against pre-fetched source content stored in `/tmp/cited-research/<topic-slug>/` files.
+**Purpose:** Verify claims against pre-fetched source content stored in `~/.local/share/cited-research-data/<topic-slug>/` files.
 **Tools required:** Read, Glob (no web access needed — content is pre-fetched)
 
-The main thread pre-fetches all cited URLs and writes them to `/tmp/cited-research/<topic-slug>/` files
+The main thread pre-fetches all cited URLs and writes them to `~/.local/share/cited-research-data/<topic-slug>/` files
 before dispatching this agent. The agent reads those files via the Read tool —
 it does not need WebFetch or WebSearch. This ensures every audit runs against
 the same snapshot of source content that the research used.
