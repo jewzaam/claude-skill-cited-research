@@ -13,6 +13,18 @@ description: >
   "update the research", "refresh this research", or any task where unsupported
   claims would undermine trust. Always use for non-code research requiring
   factual grounding, even if the user doesn't explicitly request citations.
+allowed-tools:
+  - Read(~/.claude/skills/cited-research/**)
+  - Read(~/.local/share/cited-research-data/**)
+  - Write(~/.local/share/cited-research-data/**)
+  - Edit(~/.local/share/cited-research-data/**)
+  - Glob(~/.local/share/cited-research-data/**)
+  - Bash(~/.claude/skills/cited-research/.venv/bin/python ~/.claude/skills/cited-research/scripts/multi_search.py **)
+  - Bash(~/.claude/skills/cited-research/.venv/Scripts/python.exe ~/.claude/skills/cited-research/scripts/multi_search.py **)
+  - Bash(~/.claude/skills/cited-research/.venv/bin/python ~/.claude/skills/cited-research/scripts/put_data.py **)
+  - Bash(~/.claude/skills/cited-research/.venv/Scripts/python.exe ~/.claude/skills/cited-research/scripts/put_data.py **)
+  - Bash(~/.claude/skills/cited-research/.venv/bin/python ~/.claude/skills/cited-research/scripts/reap_data.py **)
+  - Bash(~/.claude/skills/cited-research/.venv/Scripts/python.exe ~/.claude/skills/cited-research/scripts/reap_data.py **)
 ---
 
 # Cited Research
@@ -278,9 +290,30 @@ models (see `references/research-basis.md` §Model Assignment by Agent Role).
 
 **Multi-engine augmentation (between iterations 1 and 2):**
 - After collecting discovery agent URL manifests, the coordinator runs
-  `scripts/multi-search.py` for each dimension's top search queries to
+  `scripts/multi_search.py` for each dimension's top search queries to
   pull results from DuckDuckGo (and any additional engines configured).
-  Run the script via: `python -m scripts.multi-search --query "..." --limit 10`
+  The script lives with the installed skill; invoke it by absolute path
+  so it works regardless of the current working directory:
+
+  Linux/macOS:
+  ```
+  ~/.claude/skills/cited-research/.venv/bin/python \
+      ~/.claude/skills/cited-research/scripts/multi_search.py \
+      --query "..." --limit 10
+  ```
+
+  Windows (git-bash):
+  ```
+  ~/.claude/skills/cited-research/.venv/Scripts/python.exe \
+      ~/.claude/skills/cited-research/scripts/multi_search.py \
+      --query "..." --limit 10
+  ```
+
+  The skill's `.venv` is populated once via `make install-dev` inside
+  `~/.claude/skills/cited-research/` — see the repo README for install
+  steps. If the venv is missing, the skill still works with degraded
+  coverage (sub-agents' WebSearch results only); report this to the user
+  once per session and proceed.
 - Merge the script's URLs into the URL manifest pool alongside the
   agents' WebSearch results
 - Deduplicate the combined pool by exact URL before fetching
@@ -323,15 +356,50 @@ See `references/research-basis.md` §Source Triage as Human Gate for evidence.
 ### Providing Fetched Content to Agents
 
 When the main thread fetches URLs for iteration 2+ or for the citation audit,
-write each page's extracted text to a temp directory at
-`/tmp/cited-research/<topic-slug>/` and pass the directory path to the agent
-prompt. Create the directory with `mkdir -p` if it does not exist. This avoids
-bloating agent prompts with raw page content and lets agents read selectively
-via the Read tool. The temp directory is ephemeral — the OS handles cleanup.
+persist each page's extracted text under `~/.local/share/cited-research-data/<topic-slug>/`
+via the `put_data.py` wrapper and pass the directory path to the agent prompt.
+Keeping fetched content out of agent prompts avoids bloat and lets agents read
+selectively via the Read tool. The data directory lives outside the skill
+install dir so writes never mutate the shipped skill.
 
-**Use the Write tool** to create each fetched-content file. Do not use `cat`,
-`echo`, heredocs, or any other Bash command to write files. Every Bash write
-command requires a separate user approval prompt — the Write tool does not.
+At the start of a new research run, reap any stale data for this topic first:
+
+Linux/macOS:
+```
+~/.claude/skills/cited-research/.venv/bin/python \
+    ~/.claude/skills/cited-research/scripts/reap_data.py <topic-slug>
+```
+
+Windows (git-bash):
+```
+~/.claude/skills/cited-research/.venv/Scripts/python.exe \
+    ~/.claude/skills/cited-research/scripts/reap_data.py <topic-slug>
+```
+
+Then persist each fetched file:
+
+```
+~/.claude/skills/cited-research/.venv/bin/python \
+    ~/.claude/skills/cited-research/scripts/put_data.py \
+    <topic-slug> <relative-path-within-slug> <<'EOF'
+# Fetched: <URL>
+# Date: <fetch timestamp>
+# Status: OK | FAILED (<reason>)
+
+<extracted text content>
+EOF
+```
+
+The wrapper validates the relative path (no `..`, no absolute paths, no
+escapes out of the slug directory), creates parent directories, and writes
+stdin verbatim. A single allowlisted Bash rule covers every call, so no
+per-file approval prompt.
+
+**Do not use the Write tool, `cat`, `echo`, or bare heredocs for persisting
+fetched content.** Each of those prompts per file; `put_data.py` does not.
+The Write-tool prohibition is about permission pain, not safety — save it
+for writing the deliverable, references, and citation files into the
+user's project directory, which is a different permission surface.
 
 Each fetched file should have a header identifying the source:
 
@@ -521,9 +589,10 @@ cited URLs so the audit agent does not need WebFetch:
 1. Read `citations.md` and extract every cited URL
 2. Batch-fetch all URLs via WebFetch (the user approves once per batch)
 3. For URLs that fail, attempt WebSearch fallbacks from the main thread
-4. Write fetched content to `/tmp/cited-research/<topic-slug>/` files (same format as Phase 1)
-5. Dispatch the Citation Audit agent with the `/tmp/cited-research/<topic-slug>/` directory path —
-   the agent reads files via Read tool, it does not fetch URLs itself
+4. Persist fetched content to `~/.local/share/cited-research-data/<topic-slug>/` via
+   `put_data.py` (see Phase 1 §Providing Fetched Content for invocation)
+5. Dispatch the Citation Audit agent with the `~/.local/share/cited-research-data/<topic-slug>/`
+   directory path — the agent reads files via Read tool, it does not fetch URLs itself
 
 The audit agent receives **only** Read and Glob tools — do not give it WebFetch
 or WebSearch. All web access happens in the main thread before the agent runs.

@@ -8,11 +8,17 @@ Queries multiple search engines and returns a deduplicated JSON list of results.
 Designed for use by the cited-research skill coordinator to broaden the URL pool
 beyond a single search engine.
 
-Usage:
-    python -m scripts.multi-search --query "..." --engines ddg --limit 10
+Usage (from the skill install directory, via its own venv):
+    ~/.claude/skills/cited-research/.venv/bin/python \\
+        ~/.claude/skills/cited-research/scripts/multi_search.py \\
+        --query "..." --engines ddg --limit 10
+
+For local development from the repo root:
+    make test-live
+    .venv/bin/python scripts/multi_search.py --query "..." --limit 10
 
 Engines:
-    ddg — DuckDuckGo (via duckduckgo-search library, no API key required)
+    ddg — DuckDuckGo (via the ddgs library, no API key required)
 
 Output:
     JSON array of {url, title, snippet, engine} objects, deduplicated by URL.
@@ -28,11 +34,10 @@ SUPPORTED_ENGINES = {"ddg"}
 def search_ddg(query: str, limit: int) -> list[dict]:
     """Search DuckDuckGo and return normalized results."""
     try:
-        from duckduckgo_search import DDGS
+        from ddgs import DDGS
     except ImportError:
         print(
-            "Error: duckduckgo-search not installed. "
-            "Run: python -m pip install duckduckgo-search",
+            "Error: ddgs not installed. Run: python -m pip install ddgs",
             file=sys.stderr,
         )
         sys.exit(1)
