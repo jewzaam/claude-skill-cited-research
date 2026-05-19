@@ -256,35 +256,36 @@ for each iteration (max 3):
 
 ### Model Assignment
 
-Specify the `model` parameter in Agent tool calls based on agent role.
+Model assignments are defined in each agent's frontmatter (`agents/*.md`).
 Verification is structurally easier than generation — lighter models handle
 mechanical tasks well, while synthesis and reasoning benefit from heavier
 models (see `references/research-basis.md` §Model Assignment by Agent Role).
 
-| Agent Role | Model | Rationale |
-|---|---|---|
-| Research — Discovery | `sonnet` | Search query generation is mechanical |
-| Research — Analysis | `opus` | Deep extraction and synthesis |
-| Citation Audit | `sonnet` | Claim-vs-source comparison |
-| Consistency Review | `sonnet` | Cross-file numerical checking |
+| Agent Role | Agent Definition | Model | Rationale |
+|---|---|---|---|
+| Research — Discovery | `research-discovery` | `sonnet` | Search query generation is mechanical |
+| Research — Counter-Discovery | `research-counter-discovery` | `sonnet` | Same as discovery |
+| Research — Analysis | `research-analysis` | `opus` | Deep extraction and synthesis |
+| Citation Audit | `citation-audit` | `sonnet` | Claim-vs-source comparison |
+| Consistency Review | `consistency-review` | `sonnet` | Cross-file numerical checking |
 
 **Iteration 1 — Discovery:**
-- Dispatch one `general-purpose` sub-agent per dimension with
-  `run_in_background: true` and `model: "sonnet"`
-- Agent tools: WebSearch only (already works in background)
+- Dispatch one `research-discovery` agent per dimension. The agent's
+  frontmatter defines model, tools, and background mode. Provide
+  DIMENSION, PROJECT_DESCRIPTION, and SEARCH_QUERIES in the invocation
+  prompt
 - Agent returns: URL manifest, preliminary findings from search snippets,
   confidence score, open questions
-- Use the **Research Agent — Discovery** template from
-  `references/sub-agent-prompts.md`
 - **Counter-Discovery** (unless user chose "Skip" in Phase 0 Step 4):
-  dispatch one Counter-Discovery agent per dimension alongside the
-  Discovery agent, also with `run_in_background: true` and `model: "sonnet"`.
-  Use the **Research Agent — Counter-Discovery** template. Counter-Discovery
-  agents seek contradicting evidence, failure cases, and minority viewpoints.
-  Their URLs merge into the same manifest pool — no tagging distinguishes
-  counter-sources from supporting sources. If the user chose "Find and gate"
-  and a Counter-Discovery agent returns confidence < 0.3 with no URLs,
-  surface this to the user before proceeding to iteration 2
+  dispatch one `research-counter-discovery` agent per dimension alongside
+  the Discovery agent. Provide DIMENSION, PROJECT_DESCRIPTION,
+  RESEARCH_QUESTION, and COUNTER_SEARCH_QUERIES in the invocation prompt.
+  Counter-Discovery agents seek contradicting evidence, failure cases, and
+  minority viewpoints. Their URLs merge into the same manifest pool — no
+  tagging distinguishes counter-sources from supporting sources. If the
+  user chose "Find and gate" and a Counter-Discovery agent returns
+  confidence < 0.3 with no URLs, surface this to the user before
+  proceeding to iteration 2
 - Main thread collects all URL manifests across all agents (Discovery +
   Counter-Discovery)
 
@@ -327,10 +328,9 @@ models (see `references/research-basis.md` §Model Assignment by Agent Role).
 - Main thread batch-fetches all URLs from all manifests via WebFetch
 - When fetching fails, attempt WebSearch fallbacks before passing results
   to agents — handle the 20-30% inaccessibility expectation at this layer
-- Dispatch agents again with `model: "opus"` and fetched page content
-  injected into the prompt
-- Use the **Research Agent — Analysis** template from
-  `references/sub-agent-prompts.md`
+- Dispatch one `research-analysis` agent per dimension. Provide
+  DIMENSION, PROJECT_DESCRIPTION, FETCHED_DIR, and DATA_TYPE in the
+  invocation prompt
 - Agent returns: extracted data with citations, follow-up URL requests
   (if any), updated confidence score
 
@@ -426,10 +426,12 @@ to the user as potentially under-sourced before proceeding to iteration 3.
 
 ### Structuring Research Agents
 
-See `references/sub-agent-prompts.md` for two research agent prompt variants:
-**Discovery** (iteration 1) and **Analysis** (iteration 2+).
+Agent definitions live in `agents/` — one `.md` file per role with YAML
+frontmatter specifying model, tools, and background mode. The coordinator
+invokes agents by name and provides dimension-specific values in the
+invocation prompt.
 
-Both templates include an accountability line ("a citation audit agent will
+All research agent definitions include an accountability line ("a citation audit agent will
 independently verify every claim you report"). The behavioral effect of this
 line on LLM output is plausible but unvalidated by published research. The
 real enforcement mechanism is structural: requiring inline citations forces
@@ -574,12 +576,11 @@ actionable answer.
 
 ## Phase 4: Verification
 
-After all files are written, launch **two independent review sub-agents in
-parallel** with `model: "sonnet"`. These agents receive NO context from the
-research conversation — they read only the produced files. This isolation
-prevents confirmation bias. Sonnet is sufficient for verification tasks, which
-are structurally easier than generation (see `references/research-basis.md`
-§Model Assignment by Agent Role).
+After all files are written, launch the `citation-audit` and
+`consistency-review` agents in parallel. These agents receive NO context
+from the research conversation — they read only the produced files. This
+isolation prevents confirmation bias. Agent frontmatter defines model and
+tools (see `references/research-basis.md` §Model Assignment by Agent Role).
 
 ### Pre-Fetch for Citation Audit
 
@@ -591,18 +592,17 @@ cited URLs so the audit agent does not need WebFetch:
 3. For URLs that fail, attempt WebSearch fallbacks from the main thread
 4. Persist fetched content to `~/.local/share/cited-research-data/<topic-slug>/` via
    `put_data.py` (see Phase 1 §Providing Fetched Content for invocation)
-5. Dispatch the Citation Audit agent with the `~/.local/share/cited-research-data/<topic-slug>/`
-   directory path — the agent reads files via Read tool, it does not fetch URLs itself
+5. Dispatch the `citation-audit` agent with DELIVERABLE_DIR and FETCHED_DIR
+   in the invocation prompt — the agent reads files via Read tool, it does
+   not fetch URLs itself
 
-The audit agent receives **only** Read and Glob tools — do not give it WebFetch
-or WebSearch. All web access happens in the main thread before the agent runs.
-This ensures the audit runs against the same source content snapshot and avoids
-the sub-agent permission boundary.
+All web access happens in the main thread before the agents run. This
+ensures the audit runs against the same source content snapshot and avoids
+the sub-agent permission boundary. Agent tool restrictions (Read and Glob
+only, no web access) are enforced by agent definition frontmatter.
 
-The Consistency Review agent also needs only Read and Glob.
-
-See `references/sub-agent-prompts.md` for both sub-agent prompt templates
-(Citation Audit and Consistency Review).
+Dispatch the `consistency-review` agent with DELIVERABLE_DIR in the
+invocation prompt.
 
 ### Handling Verification Results
 

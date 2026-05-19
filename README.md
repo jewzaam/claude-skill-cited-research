@@ -21,7 +21,8 @@ to self-police.
 |------|---------|
 | [`SKILL.md`](SKILL.md) | The skill instructions Claude Code loads at invocation. Phase 0 plan mode through Phase 5 index maintenance. |
 | [`CLAUDE.md`](CLAUDE.md) | Contributor guidance for editing this skill. |
-| [`references/`](references/) | Sub-agent prompt templates, citation format, update workflow, and the research-basis evidence log. |
+| [`agents/`](agents/) | Persistent agent definitions (one `.md` per role) with YAML frontmatter for model, tools, and background mode. |
+| [`references/`](references/) | Citation format, update workflow, and the research-basis evidence log. |
 | [`scripts/multi_search.py`](scripts/multi_search.py) | Multi-engine search helper the coordinator runs between discovery iterations to reduce single-engine bias. |
 | [`tests/`](tests/) | Unit tests for `multi_search.py`. Run with `make check`. |
 | [`TEST_PLAN.md`](TEST_PLAN.md) | Test rationale and scope. |

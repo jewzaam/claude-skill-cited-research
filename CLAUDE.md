@@ -21,14 +21,14 @@ corresponding section in that file, check whether the change is consistent
 with the evidence. If new research supersedes an existing finding, update
 both the skill instruction and the research basis entry.
 
-## Agent Prompts
+## Agent Definitions
 
-Agent prompt templates live in `references/sub-agent-prompts.md`. Keep
-prompts lean and task-oriented — longer explicit reasoning instructions
-degrade performance in research agents (Xu et al., "Search-R1",
-arXiv:2602.19526, 2026). The current prompts are structured for "fast
-thinking" (direct search/answer) over "slow thinking" (explicit reasoning
-before each action).
+Agent definitions live in `agents/` as `.md` files with YAML frontmatter
+(model, tools, background mode). Keep agent body prompts lean and
+task-oriented — longer explicit reasoning instructions degrade performance
+in research agents (Xu et al., "Search-R1", arXiv:2602.19526, 2026). The
+current prompts are structured for "fast thinking" (direct search/answer)
+over "slow thinking" (explicit reasoning before each action).
 
 ## Update Workflow
 
