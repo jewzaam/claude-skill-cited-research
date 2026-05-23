@@ -29,6 +29,18 @@ def _run_reap(argv: list[str]) -> None:
         reap_data.main()
 
 
+def _bootstrap(data_root: Path, slug: str) -> Path:
+    """Create the slug root the way bootstrap_tmp.sh would.
+
+    put_data.py refuses to create the slug root itself, so every test that
+    invokes put_data must bootstrap first. Skipping this helper would make
+    put_data exit 1 with the "Run scripts/bootstrap_tmp.sh" error.
+    """
+    slug_root = data_root / slug
+    slug_root.mkdir(parents=True, exist_ok=True)
+    return slug_root
+
+
 # ---------------------------------------------------------------------------
 # _data_paths.validate_slug
 # ---------------------------------------------------------------------------
@@ -107,13 +119,15 @@ class TestSafeTarget:
 
 class TestPutData:
     def test_writes_stdin_verbatim(self, data_root, capsys):
+        _bootstrap(data_root, "topic-a")
         content = "# Fetched: https://example.test\n\nRaw body content.\n"
         _run_put(["topic-a", "page.md"], content)
         target = data_root / "topic-a" / "page.md"
         assert target.read_text(encoding="utf-8") == content
         assert str(target) in capsys.readouterr().out
 
-    def test_creates_parent_directories(self, data_root):
+    def test_creates_sub_directories_inside_slug(self, data_root):
+        _bootstrap(data_root, "topic-b")
         _run_put(["topic-b", "deep/nested/file.md"], "x")
         assert (data_root / "topic-b" / "deep" / "nested" / "file.md").exists()
 
@@ -125,24 +139,41 @@ class TestPutData:
         assert "Usage:" in capsys.readouterr().err
 
     def test_path_escape_rejected(self, data_root, capsys):
+        _bootstrap(data_root, "topic-c")
         with pytest.raises(SystemExit) as excinfo:
             _run_put(["topic-c", "../outside.md"], "oops")
         assert excinfo.value.code == 1
         assert "invalid relative path" in capsys.readouterr().err
 
     def test_overwrite_replaces_content(self, data_root):
+        _bootstrap(data_root, "topic-d")
         _run_put(["topic-d", "page.md"], "first")
         _run_put(["topic-d", "page.md"], "second")
         assert (data_root / "topic-d" / "page.md").read_text(
             encoding="utf-8"
         ) == "second"
 
+    def test_missing_slug_root_is_hard_error(self, data_root, capsys):
+        """put_data must refuse to create the slug root itself.
+
+        Auto-creating would silently bypass the parent `.gitignore` that
+        bootstrap_tmp.sh provisions, risking accidental commits of fetched
+        URLs. The error message tells the caller exactly how to recover.
+        """
+        # Note: no _bootstrap() call — slug root deliberately absent.
+        with pytest.raises(SystemExit) as excinfo:
+            _run_put(["never-bootstrapped", "page.md"], "x")
+        assert excinfo.value.code == 1
+        err = capsys.readouterr().err
+        assert "slug root does not exist" in err
+        assert "bootstrap_tmp.sh never-bootstrapped" in err
+        assert not (data_root / "never-bootstrapped").exists()
+
     def test_atomic_write_leaves_target_untouched_on_failure(
         self, data_root, capsys, monkeypatch
     ):
         """If the rename fails, the existing target must be preserved."""
-        target_dir = data_root / "topic-f"
-        target_dir.mkdir()
+        target_dir = _bootstrap(data_root, "topic-f")
         target = target_dir / "page.md"
         target.write_text("original", encoding="utf-8")
 
@@ -159,8 +190,7 @@ class TestPutData:
 
     def test_tempfile_cleaned_up_on_failure(self, data_root, monkeypatch):
         """No .part debris left behind when the rename fails."""
-        target_dir = data_root / "topic-g"
-        target_dir.mkdir()
+        target_dir = _bootstrap(data_root, "topic-g")
 
         def _boom(self, _other):
             raise OSError("simulated rename failure")

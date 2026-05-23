@@ -24,7 +24,11 @@ to self-police.
 | [`agents/`](agents/) | Persistent agent definitions (one `.md` per role) with YAML frontmatter for model, tools, and background mode. |
 | [`references/`](references/) | Citation format, update workflow, and the research-basis evidence log. |
 | [`scripts/multi_search.py`](scripts/multi_search.py) | Multi-engine search helper the coordinator runs between discovery iterations to reduce single-engine bias. |
-| [`tests/`](tests/) | Unit tests for `multi_search.py`. Run with `make check`. |
+| [`scripts/bootstrap_tmp.sh`](scripts/bootstrap_tmp.sh) | Bash bootstrap for `./.tmp-cited-research/<slug>/` — per-slug wipe, idempotent parent `.gitignore`. |
+| [`scripts/put_data.py`](scripts/put_data.py) | Stdin-to-file wrapper used by the coordinator and audit sub-agents to persist transient artifacts under the slug subdir. |
+| [`scripts/reap_data.py`](scripts/reap_data.py) | Per-slug recursive cleanup of `./.tmp-cited-research/<slug>/`. Idempotent. |
+| [`scripts/_data_paths.py`](scripts/_data_paths.py) | `DATA_ROOT` resolution and slug/path validation shared by the wrappers. |
+| [`tests/`](tests/) | Unit tests for the helpers above. Run with `make check`. |
 | [`TEST_PLAN.md`](TEST_PLAN.md) | Test rationale and scope. |
 
 ## Installing the skill
@@ -91,6 +95,67 @@ make help        # list all targets
 ```
 
 The Makefile owns venv creation under `.venv/`.
+
+## Streamlining Permissions
+
+`SKILL.md` deliberately leaves `allowed-tools:` empty. Nothing is
+auto-injected at skill load, so the frontmatter has nothing to
+pre-approve. All runtime tools the skill needs — reading the tmp
+workspace, invoking the four helper scripts, writing the deliverable —
+flow through the standard permission path, which means a fresh user
+sees an approval prompt the first time each one is used.
+
+To eliminate those prompts across sessions, add the entries below to
+**`~/.claude/settings.json`** (user-global) under `permissions.allow`.
+Each one is scoped narrowly: glob-restricted Read/Glob, exact-prefix
+Bash invocations of helper scripts, Write/Edit restricted to the
+deliverable directory.
+
+```jsonc
+{
+  "permissions": {
+    "allow": [
+      // Transient workspace — read-only access to inspect what the
+      // coordinator persisted for sub-agent hand-off.
+      "Read(./.tmp-cited-research/**)",
+      "Read(**/.tmp-cited-research/**)",
+      "Glob(./.tmp-cited-research/**)",
+      "Glob(**/.tmp-cited-research/**)",
+
+      // Skill's own files (agent definitions, references, scripts).
+      "Read(~/.claude/skills/cited-research/**)",
+
+      // Bootstrap — provisions ./.tmp-cited-research/<slug>/ and the
+      // parent .gitignore '*'. Called once per research run.
+      "Bash(bash ~/.claude/skills/cited-research/scripts/bootstrap_tmp.sh **)",
+
+      // Data wrappers — stdin-to-file and per-slug cleanup. Used by
+      // the coordinator and by the citation-audit / consistency-review
+      // sub-agents.
+      "Bash(~/.claude/skills/cited-research/.venv/bin/python ~/.claude/skills/cited-research/scripts/put_data.py **)",
+      "Bash(~/.claude/skills/cited-research/.venv/Scripts/python.exe ~/.claude/skills/cited-research/scripts/put_data.py **)",
+      "Bash(~/.claude/skills/cited-research/.venv/bin/python ~/.claude/skills/cited-research/scripts/reap_data.py **)",
+      "Bash(~/.claude/skills/cited-research/.venv/Scripts/python.exe ~/.claude/skills/cited-research/scripts/reap_data.py **)",
+
+      // Multi-engine search helper — broadens the URL pool beyond the
+      // model's built-in WebSearch (DuckDuckGo + any engines added in
+      // multi_search.py). Optional; falls back to WebSearch if absent.
+      "Bash(~/.claude/skills/cited-research/.venv/bin/python ~/.claude/skills/cited-research/scripts/multi_search.py **)",
+      "Bash(~/.claude/skills/cited-research/.venv/Scripts/python.exe ~/.claude/skills/cited-research/scripts/multi_search.py **)"
+    ]
+  }
+}
+```
+
+Each entry is independent — add only the ones you want streamlined.
+The two `.venv/bin/python` and `.venv/Scripts/python.exe` variants
+cover Linux/macOS and Windows installs of the skill's private venv;
+add both if you switch between platforms.
+
+Final-deliverable writes (`research/<topic-slug>/**`) intentionally stay
+out of this allowlist — those land in your current project repo, where
+broad Write permission is a per-project decision rather than a
+skill-global one.
 
 ## Design evidence
 
