@@ -1,5 +1,6 @@
 ---
 name: cited-research
+model: opus
 description: >
   Produces citation-backed research documents with independent verification.
   Every claim traces to a web source visited in-session, and isolated sub-agents
