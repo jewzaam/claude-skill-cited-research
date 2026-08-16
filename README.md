@@ -23,8 +23,10 @@ to self-police.
 | [`CLAUDE.md`](CLAUDE.md) | Contributor guidance for editing this skill. |
 | [`agents/`](agents/) | Persistent agent definitions (one `.md` per role) with YAML frontmatter for model, tools, and background mode. |
 | [`references/`](references/) | Citation format, update workflow, and the research-basis evidence log. |
-| [`scripts/multi_search.py`](scripts/multi_search.py) | Multi-engine search helper the coordinator runs between discovery iterations to reduce single-engine bias. |
+| [`scripts/multi_search.py`](scripts/multi_search.py) | Multi-engine search across up to eight backends. The skill's only sanctioned search path — WebSearch is banned. |
 | [`scripts/bootstrap_tmp.sh`](scripts/bootstrap_tmp.sh) | Bash bootstrap for `./.tmp-cited-research/<slug>/` — per-slug wipe, idempotent parent `.gitignore`. |
+| [`scripts/fetch_url.py`](scripts/fetch_url.py) | Reads a URL through the host-side fetch service and persists the extracted text. The only page-reading path that works inside a sandbox. |
+| [`scripts/run_report.py`](scripts/run_report.py) | Post-run validation report — agent losses, engines used, fetch outcomes, citation tiers, verified-vs-not. Computed from artifacts, not composed by the model. |
 | [`scripts/put_data.py`](scripts/put_data.py) | Stdin-to-file wrapper used by the coordinator and audit sub-agents to persist transient artifacts under the slug subdir. |
 | [`scripts/reap_data.py`](scripts/reap_data.py) | Per-slug recursive cleanup of `./.tmp-cited-research/<slug>/`. Idempotent. |
 | [`scripts/_data_paths.py`](scripts/_data_paths.py) | `DATA_ROOT` resolution and slug/path validation shared by the wrappers. |
@@ -56,10 +58,99 @@ by the absolute path `~/.claude/skills/cited-research/.venv/bin/python
 correctly regardless of your working directory when Claude Code uses it.
 
 If you skip `make install-dev`, the skill still works, but sub-agents
-fall back to Claude's built-in WebSearch only — you lose the
-multi-engine diversity boost documented in
+have no search path at all. `multi_search.py` is the skill's only
+sanctioned search tool — WebSearch is banned as a source of URLs because
+its model-synthesized answer is an interpretation of results rather than
+source text. Without the venv, a research run cannot discover sources and
+should stop. See
 [`references/research-basis.md`](references/research-basis.md)
 §Multi-Engine Search Diversity.
+
+**Inside an OpenShell sandbox, `multi_search.py` needs the search engines
+in the network policy.** Without them, `ddgs` fails with
+`ProxyError: 403 Forbidden` or a `tunnel error` — the CONNECT proxy
+refusing a host it does not allow.
+
+Despite the name, `ddgs` is a metasearch layer, not a DuckDuckGo client.
+As of ddgs 9.14.4 it registers **nine text-search backends**: Brave,
+DuckDuckGo, Google, Grokipedia, Mojeek, Startpage, Wikipedia, Yahoo and
+Yandex. The script reads that list from `ddgs.engines.ENGINES` at runtime
+rather than hardcoding it, so a library update that adds an engine is picked
+up automatically. Wikipedia and Grokipedia are excluded from the default set
+as encyclopedias rather than web indexes — still selectable via
+`--backends`.
+
+Note that **Bing is not a text backend** — ddgs registers it for images and
+news only. Naming it is not harmless: ddgs silently falls back to
+auto-selection for a backend it does not recognise for the category, so an
+unregistered name yields the full auto pool while looking like one isolated
+engine. The script rejects unregistered names for this reason. Given a backend list it falls through to whichever of them
+respond, so a partial host list still works — measured: with four of eight
+backends failing, a `--limit 10` query still returned 10 unique results,
+as did a single working backend. Blocked engines cost diversity, not
+volume, and only a total block fails the run.
+
+Allow as many as you can: `duckduckgo.com`, `html.duckduckgo.com`,
+`search.brave.com`, `www.mojeek.com`, `www.startpage.com`,
+`search.yahoo.com`, `www.google.com`, `yandex.com` — port 443, each with
+both `protocol: rest` and `enforcement: enforce`. Add `en.wikipedia.org` and
+`grokipedia.com` only if you intend to select those backends explicitly;
+without them `--health` reports both as ConnectError. `www.bing.com` is not
+needed for text search. A ready-made block is in
+[`openshell-sandbox/policies/fetch-service.yaml`](https://github.com/jewzaam/openshell-sandbox/blob/main/policies/fetch-service.yaml).
+
+Engines block intermittently on their own, independent of policy, and the
+mix shifts within minutes. Two probes taken minutes apart in August 2026
+returned 3/8 and then 2/9 alive. Run `--health` at the start of a session
+and pass the survivors to `--backends`. Expect that mix to shift; the point of naming several backends is
+that it does not matter which ones are up.
+
+Do **not** try to route search through the fetch service instead. These
+engines answer a plain `urllib`/curl GET with an anti-bot challenge page
+(HTTP 202, zero results) regardless of User-Agent — verified from the same
+host and IP with both a browser UA and the service's own UA. What makes
+`ddgs` work is `primp`'s Chrome TLS impersonation, not any header. Because
+CONNECT is an opaque tunnel, that impersonation survives the proxy intact,
+which is why direct egress works and the fetch-service route cannot.
+
+`--backends` controls which engines are queried; the default is every
+registered text backend except the encyclopedias. The script never passes
+the library's `"auto"`, which picks at random per call and can collapse to
+one engine.
+
+**Every run is split into two disjoint waves**, queried separately and
+merged. A single call fills `--limit` from whichever backend answers first,
+so one call buys far less diversity than the backend list implies. The split
+has no disabling flag. The JSON output carries a `coverage` block reporting
+`single_wave`, `returned_by_wave` and `unique_by_wave` — a wave can answer
+successfully and still contribute zero new URLs, measured at 0 of 6 on one
+live query and 2 of 6 on another. The script exits non-zero when nothing
+comes back at all.
+
+## Reading web pages
+
+The skill reads pages through a host-side fetch service rather than
+`WebFetch`. Inside an OpenShell sandbox, `WebFetch` cannot reach arbitrary
+hosts — the only egress is a CONNECT proxy limited to hosts named in the
+sandbox network policy, and research follows links discovered at runtime.
+`scripts/fetch_url.py` asks the host-side service to make the request and
+writes the extracted text into the run's `fetched/` directory.
+
+Verify it before a run:
+
+```bash
+~/.claude/skills/cited-research/.venv/bin/python \
+    ~/.claude/skills/cited-research/scripts/fetch_url.py --check
+```
+
+If that does not print `fetch service OK`, start the service from the host
+(`sandbox.sh --fetch-service`). Search runs separately, through
+`multi_search.py` — see the section above.
+
+The service is documented at
+[openshell-sandbox/docs/fetch-service.md](https://github.com/jewzaam/openshell-sandbox/blob/main/docs/fetch-service.md);
+the script's exit codes are in
+[`references/data-persistence.md`](references/data-persistence.md).
 
 Restart Claude Code (or start a new session). The skill triggers
 automatically on research-style prompts — "compare X and Y", "what does
@@ -137,9 +228,17 @@ deliverable directory.
       "Bash(~/.claude/skills/cited-research/.venv/bin/python ~/.claude/skills/cited-research/scripts/reap_data.py **)",
       "Bash(~/.claude/skills/cited-research/.venv/Scripts/python.exe ~/.claude/skills/cited-research/scripts/reap_data.py **)",
 
+      // Fetch helper — reads a URL via the host-side fetch service and
+      // persists the extracted text. WebFetch does not work inside a
+      // sandbox; this is the only page-reading path. See
+      // openshell-sandbox/docs/fetch-service.md.
+      "Bash(~/.claude/skills/cited-research/.venv/bin/python ~/.claude/skills/cited-research/scripts/fetch_url.py **)",
+      "Bash(~/.claude/skills/cited-research/.venv/Scripts/python.exe ~/.claude/skills/cited-research/scripts/fetch_url.py **)",
+
       // Multi-engine search helper — broadens the URL pool beyond the
-      // model's built-in WebSearch (DuckDuckGo + any engines added in
-      // multi_search.py). Optional; falls back to WebSearch if absent.
+      // skill's only sanctioned search path (DuckDuckGo, Brave, Bing,
+      // Mojeek, Startpage, Yahoo, Google, Yandex via ddgs). Required —
+      // WebSearch is banned as a source of URLs.
       "Bash(~/.claude/skills/cited-research/.venv/bin/python ~/.claude/skills/cited-research/scripts/multi_search.py **)",
       "Bash(~/.claude/skills/cited-research/.venv/Scripts/python.exe ~/.claude/skills/cited-research/scripts/multi_search.py **)"
     ]

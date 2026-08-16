@@ -13,6 +13,29 @@ Accuracy", USC, arXiv:2603.18507, 2026 —
 <https://arxiv.org/html/2603.18507v1>). Research agents need maximum factual
 recall, not role-playing.
 
+## WebSearch Is Banned; Search Is Not a Source
+
+Search runs only through `scripts/multi_search.py`. WebSearch must not be
+used to find or support anything, because it returns a model-synthesized
+answer above its links. That prose is
+an interpretation of results, not source text. If it reaches an agent's
+findings it becomes an upstream bias vector with a feedback loop: it shapes
+which URLs get fetched, which claims get written, and then hides behind a
+citation to a page nobody read.
+
+Three places enforce the separation. Change them together or not at all:
+
+- `SKILL.md` principle 1 — claims come from fetched page text; search
+  contributes URLs and verbatim snippet quotes only.
+- `agents/research-discovery.md` and `agents/research-counter-discovery.md`
+  — "Snippet Quotes" (verbatim, quoted) rather than "Preliminary Findings",
+  and an explicit ban on restating the synthesized answer.
+- `agents/citation-audit.md` — a claim with no fetched file grades
+  INACCESSIBLE, never VERIFIED.
+
+Do not reintroduce a discovery-phase section that invites agents to state
+conclusions. The phase exists to find pages, not to answer the question.
+
 ## Research Basis
 
 Design decisions in this skill are documented with supporting evidence in
@@ -40,11 +63,64 @@ in `SKILL.md`.
 ## Multi-Engine Search Script
 
 `scripts/multi_search.py` is the coordinator's augmentation tool for
-broadening the URL pool beyond Claude's built-in WebSearch. To add a new
-engine:
+the skill's only sanctioned search path. WebSearch is banned.
 
-1. Write a `search_<engine>(query, limit) -> list[dict]` function that
-   returns `{url, title, snippet, engine}` dicts.
+Two things about `ddgs` that are easy to get wrong:
+
+- **It is a metasearch layer, not a DuckDuckGo client.** It fronts
+  DuckDuckGo, Brave, Bing, Mojeek, Startpage, Yahoo, Google, and Yandex.
+  Anything that allowlists hosts (a sandbox network policy) should name
+  all of them. Not fatal if it does not: given a backend list, `ddgs`
+  falls through to whichever respond, and a full result set comes back
+  even from one working engine. Blocked backends cost diversity, not
+  volume.
+- **The point of this script is a corpus that did not come from
+  a model's synthesis of results.** Cross-engine diversity within `ddgs`
+  is a bonus, not the
+  purpose. Do not add machinery to guarantee *all-engine* coverage. But
+  **two** independent samples is the floor, not a bonus — that is what the
+  wave split enforces, and it is why `--health` exits non-zero when fewer
+  than two backends are alive.
+- **Do not pass `backend="auto"`.** It picks engines at random per call,
+  which makes coverage non-reproducible and can collapse to a single
+  engine — the outcome this script exists to prevent.
+- **Read the backend list from the library at runtime, never hardcode
+  it.** `text_backends()` reads `ddgs.engines.ENGINES["text"]`. A
+  hardcoded list silently narrows coverage when `ddgs` adds engines, and
+  — worse — can name an engine that is not registered for the text
+  category at all.
+- **Unknown backend names are not a no-op.** `ddgs` silently falls back
+  to auto-selection when a name is not registered for the requested
+  category — verified directly: the bogus name `totallyfakeengine`
+  returned the same result set as `bing` (registered for images/news,
+  not text). `validate_backends()` rejects unregistered names before
+  they reach `ddgs` for exactly this reason: an unnoticed typo or
+  wrong-category name would otherwise return the full auto pool while
+  looking like one isolated engine, destroying the two-wave split's
+  guarantee without any error surfacing. Do not remove that validation,
+  and do not "helpfully" pass unknown names through.
+- **`--health` probes a deliberately unregistered sentinel name first**
+  to establish what "no isolation" looks like (see the unknown-backend
+  fallback above). Any backend whose results are identical to the
+  sentinel's is reported `FALLBACK` rather than `OK` — without this
+  check the probe gives false positives; it previously reported an
+  unregistered `bing` as healthy.
+
+**Do not add a flag that disables the two-wave split, and do not collapse
+the waves into one call.** A single call fills `--limit` from whichever
+backend answers first, so the split is the only thing that forces two
+independent engine populations to contribute. Coverage is reported in the
+JSON payload rather than only on stderr for the same reason: a caller must
+not be able to overlook a run that collapsed to one sample. `unique_by_wave`
+exists because a wave can answer successfully and still add zero new URLs —
+measured at 0 of 6 on one live query and 2 of 6 on another.
+
+To add a new engine:
+
+1. Write a `search_<engine>(query, limit) -> dict` function returning
+   `{"results": [{url, title, snippet, wave, backends}, ...],
+   "coverage": {...}}`. If the engine has no wave concept of its own, still
+   populate `coverage` so the caller's checks work uniformly.
 2. Register the engine in both `SUPPORTED_ENGINES` and `ENGINE_FUNCTIONS`.
 3. Declare any new library dependency in `pyproject.toml`.
 4. Add unit tests in `tests/test_multi_search.py` that mock the client at
@@ -53,6 +129,74 @@ engine:
 
 The module name must remain underscore-only (`multi_search`, not
 `multi-search`) so `python -m scripts.multi_search` resolves.
+
+## Fetch Service Script
+
+`scripts/fetch_url.py` is the only page-reading path. `WebFetch` fails
+inside a sandbox (`Socket is closed`) because it egresses from the
+container and hits OpenShell's CONNECT proxy; the fetch service runs on
+the host and performs the request over plain HTTP on the sandbox's
+behalf. Search is a separate path entirely — `multi_search.py` egresses
+directly, because the engines reject the fetch service's plain GET with an
+anti-bot challenge.
+
+When changing this script:
+
+- Keep it stdlib-only. It runs before `make install-dev` might have been
+  re-run, and adding a dependency to the fetch path makes the skill fail
+  in exactly the situation where it is least debuggable.
+- Preserve the 403 disambiguation. A `403` whose body starts `refused:`
+  is the service declining one URL (recoverable, recorded as `FAILED`);
+  any other `403` is the proxy refusing the service address itself
+  (exit 3, operator action). Collapsing these two makes a policy
+  misconfiguration look like 100% of sources being unreachable.
+- Preserve exit code 3 as distinct from 0. Exit 0 means a file was
+  written, including a `FAILED` one; the run continues. Exit 3 means no
+  file and no possible progress.
+- HTML-to-text extraction is deliberately stdlib `HTMLParser`. It falls
+  back to raw markup on a parse error rather than writing an empty file,
+  because an empty file reads to an audit agent as "the source contained
+  nothing" — a silent false negative.
+- Encyclopedia reference mining is deterministic parsing, not a model
+  instruction. A Wikipedia/Grokipedia URL gets its outbound citation
+  links written to a `<name>.refs` sidecar, one URL per line. MediaWiki
+  marks citations with `class="external"`; where that marker is absent
+  (Grokipedia is not MediaWiki) it falls back to absolute cross-host
+  links, and infrastructure hosts (wikimedia.org, wikidata.org,
+  creativecommons.org, sister projects) are filtered because they
+  appear on every page and are never the cited source. Do not move this
+  back into prose instructions for the model — instructions cost tokens
+  on every run and depend on the model complying; parsing is
+  deterministic and free.
+
+Behavior contract and operator-facing docs live in
+`references/data-persistence.md`. The service itself is documented in
+the openshell-sandbox repo — do not restate its contract here.
+
+## Run Report
+
+`scripts/run_report.py` computes the post-run validation report from
+artifacts on disk. It exists so that "how did the run go" is counted, not
+recalled — a model summarising its own run reports what it remembers doing,
+which is how a run that skipped multi-engine search entirely still got
+described as multi-engine.
+
+When changing it:
+
+- **Keep every number derived from a file.** If a figure cannot be counted
+  from `agents.tsv`, `search/*.json`, `fetched/*.md`, `citations.md` or
+  `audit/citation-audit.md`, it does not belong in the report.
+- **Report missing inputs explicitly** ("no agents.tsv — …"). A silently
+  omitted section reads as a clean result.
+- **Ordinal scales print in scale order, not by frequency.** Tiers 1-4 and
+  the grade severity order are fixed; engines and HTTP codes sort by count.
+  Absent tiers still print as zero, because "Tier 1: 0" is a finding.
+- **Gloss anything a reader would have to look up**, such as HTTP status
+  codes.
+
+`SKILL.md` requires the coordinator to paste the output verbatim into its
+reply. That instruction exists because running the script does not show it
+to anyone — command output reaches the model, not reliably the user.
 
 ## Data Persistence Wrappers
 
@@ -100,3 +244,9 @@ target; do not run `python -m venv` or `pip install` manually.
 Live-network tests are marked `@pytest.mark.live` and deselected by
 default. Run them on demand with `make test-live` — they are a manual
 sanity check, not a CI gate.
+
+`lint` runs flake8 with `-j 1`. In a rootless container without POSIX
+semaphores, flake8's `multiprocessing.Pool` raises `PermissionError` and
+fails the target before linting anything. The repo is ~11 files, so
+serial linting costs nothing measurable and works in both sandboxes and
+on a host — do not remove the flag to "restore parallelism".

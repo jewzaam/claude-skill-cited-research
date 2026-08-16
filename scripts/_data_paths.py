@@ -13,6 +13,7 @@ mutation.
 
 import re
 import sys
+import tempfile
 from pathlib import Path
 
 DATA_ROOT = Path.cwd() / ".tmp-cited-research"
@@ -33,6 +34,55 @@ def validate_slug(slug: str) -> None:
             "(expected kebab-case lowercase alphanumerics)",
             file=sys.stderr,
         )
+        sys.exit(1)
+
+
+def require_slug_root(slug: str) -> Path:
+    """Return the slug root, exiting 1 if bootstrap_tmp.sh has not run.
+
+    Auto-creating the slug root would bypass the parent `.gitignore` that
+    bootstrap installs, risking fetched URLs leaking into a commit.
+    """
+    slug_root = DATA_ROOT / slug
+    if not slug_root.is_dir():
+        print(
+            f"Error: slug root does not exist: {slug_root}. "
+            f"Run scripts/bootstrap_tmp.sh {slug} first.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    return slug_root
+
+
+def atomic_write(target: Path, content: str) -> None:
+    """Write `content` to `target` atomically, creating parent dirs.
+
+    Streams to a sibling tempfile then renames into place, so either the
+    whole content lands at `target` or `target` is unchanged — audit agents
+    never read a half-written file. The tempfile is cleaned up on any
+    OSError so no `.part` debris accumulates.
+    """
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=target.parent,
+            prefix=f".{target.name}.",
+            suffix=".part",
+            delete=False,
+        ) as tmp:
+            tmp.write(content)
+            tmp_path = Path(tmp.name)
+        tmp_path.replace(target)
+    except OSError as e:
+        if tmp_path is not None:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        print(f"Error writing {target}: {e}", file=sys.stderr)
         sys.exit(1)
 
 

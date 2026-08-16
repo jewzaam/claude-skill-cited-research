@@ -19,11 +19,8 @@ fetched URLs). Intermediate directories *inside* the slug (e.g.,
 """
 
 import sys
-import tempfile
-from pathlib import Path
 
-from scripts import _data_paths
-from scripts._data_paths import safe_target
+from scripts._data_paths import atomic_write, require_slug_root, safe_target
 
 
 def main() -> None:
@@ -32,44 +29,8 @@ def main() -> None:
         sys.exit(2)
     slug, rel = sys.argv[1], sys.argv[2]
     target = safe_target(slug, rel)
-    # Resolve DATA_ROOT via the module rather than a top-level `from … import
-    # DATA_ROOT`, so tests monkeypatching `_data_paths.DATA_ROOT` are honored.
-    slug_root = _data_paths.DATA_ROOT / slug
-    if not slug_root.is_dir():
-        print(
-            f"Error: slug root does not exist: {slug_root}. "
-            f"Run scripts/bootstrap_tmp.sh {slug} first.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    content = sys.stdin.read()
-
-    # Atomic write: stream to a sibling tempfile, then rename into place.
-    # Either the whole content lands at `target` or `target` is unchanged —
-    # audit agents never read a half-written file. The tempfile is cleaned
-    # up on any OSError so no `.part` debris accumulates.
-    tmp_path: Path | None = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            encoding="utf-8",
-            dir=target.parent,
-            prefix=f".{target.name}.",
-            suffix=".part",
-            delete=False,
-        ) as tmp:
-            tmp.write(content)
-            tmp_path = Path(tmp.name)
-        tmp_path.replace(target)
-    except OSError as e:
-        if tmp_path is not None:
-            try:
-                tmp_path.unlink(missing_ok=True)
-            except OSError:
-                pass
-        print(f"Error writing {target}: {e}", file=sys.stderr)
-        sys.exit(1)
+    require_slug_root(slug)
+    atomic_write(target, sys.stdin.read())
     print(str(target))
 
 

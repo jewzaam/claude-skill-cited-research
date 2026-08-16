@@ -6,12 +6,57 @@ This file expands `SKILL.md §Phase 1`'s pointer to fetched-content
 persistence. Read it when the coordinator needs to persist fetched URLs
 or pass a fetched-content directory to a sub-agent.
 
+## Scope: which writer for which artifact
+
+| Artifact | Written by |
+|---|---|
+| Fetched page content (sandbox) | `fetch_url.py` — fetches and persists in one step |
+| Fetched page content (`WebFetch` available) | `put_data.py` heredoc, below |
+| Operator-supplied content (paywalled PDFs, cached copies) | `put_data.py` heredoc, below |
+| Audit reports from sub-agents | `put_data.py` heredoc, below |
+| Deliverable, references, citations | Write tool, in the user's project directory |
+
+Do not pipe `fetch_url.py` output through `put_data.py` — it writes its
+own file, and doing both produces a duplicate with a mangled header.
+
+## `fetch_url.py`
+
+```
+~/.claude/skills/cited-research/.venv/bin/python \
+    ~/.claude/skills/cited-research/scripts/fetch_url.py \
+    <topic-slug> fetched/<name>.md "<url>"
+```
+
+Windows (git-bash): swap `.venv/bin/python` for
+`.venv/Scripts/python.exe`. It prints `<status>\t<path>`.
+
+The script calls the host-side fetch service, whose behavior — request
+format, response envelope, limits, and what to do when it is offline — is
+documented at
+<https://github.com/jewzaam/openshell-sandbox/blob/main/docs/fetch-service.md>.
+`--check` probes the service and is the preflight in
+`SKILL.md §Phase 1`.
+
+Exit codes:
+
+| Code | Meaning | What to do |
+|---|---|---|
+| `0` | A file was written — the page (`Status: OK`) or a recorded failure (`Status: FAILED`) | Continue |
+| `1` | Write error, or a request the service rejected as malformed | Fix the invocation |
+| `2` | Usage error | Fix the arguments |
+| `3` | Service unreachable, or the network policy blocks it | Stop and tell the operator |
+
+A `FAILED` file is not a run error. Never delete one — the citation-audit
+agent grades those citations `INACCESSIBLE`, which is truthful. Removing
+them fakes coverage. Binary responses (PDFs, images) are recorded as
+`FAILED (binary content-type …)`; fall back to the PDF guidance in
+`SKILL.md §Expect Source Failures`.
+
 ## Why persistence is out of agent prompts
 
-When the main thread fetches URLs for iteration 2+ or for the citation
-audit, persist each page's extracted text under
-`./.tmp-cited-research/<topic-slug>/` via the `put_data.py` wrapper and
-pass the directory path to the agent prompt. Keeping fetched content out
+Fetched page content lives under
+`./.tmp-cited-research/<topic-slug>/fetched/`; the directory path goes
+into the agent prompt, never the content. Keeping fetched content out
 of agent prompts avoids bloat and lets agents read selectively via the
 Read tool. The data directory lives at the project root so artifacts
 stay colocated with the research output rather than orphaned in a
@@ -34,9 +79,9 @@ an individual slug without re-creating it (e.g., on session teardown),
 but a fresh run on a topic should call `bootstrap_tmp.sh` rather than
 `reap_data.py` to ensure the parent `.gitignore` is in place.
 
-**Bootstrap is not optional.** `put_data.py` deliberately refuses to
-create the slug root — if you skip the bootstrap, the very first
-`put_data.py` call returns:
+**Bootstrap is not optional.** `put_data.py` and `fetch_url.py` both
+deliberately refuse to create the slug root — if you skip the bootstrap,
+the very first call returns:
 
 ```
 Error: slug root does not exist: <path>. Run scripts/bootstrap_tmp.sh <slug> first.
@@ -48,7 +93,7 @@ fetched URLs could leak into a commit. Intermediate directories
 *inside* the slug (e.g., `audit/`, `fetched/`) are still auto-created
 by `put_data.py`; only the slug root itself is bootstrap-owned.
 
-## Persist each fetched file
+## Persist operator-supplied content or an agent report
 
 ```
 ~/.claude/skills/cited-research/.venv/bin/python \
@@ -69,15 +114,18 @@ creates parent directories, and writes stdin verbatim. A single
 allowlisted Bash rule covers every call, so no per-file approval
 prompt.
 
-For failed fetches, still create the file with the FAILED status so
-agents can see which URLs were inaccessible and report accordingly.
+Use the same header format for operator-supplied content so agents cannot
+tell it apart structurally from a fetched page — set `# Status: OK` and
+record the true origin in the `# Fetched:` line (e.g., a DOI or
+"operator-supplied copy of <URL>").
 
-## Why only `put_data.py`
+## Why only these two writers
 
-All writes to `./.tmp-cited-research/` route through `put_data.py`.
-Write/Edit on the data directory are deliberately NOT in this skill's
-`allowed-tools` — `put_data.py` is the only path in, covered by a
-single Bash allowlist rule. The audit sub-agents (`citation-audit`,
+All writes to `./.tmp-cited-research/` route through `put_data.py` or
+`fetch_url.py`. Write/Edit on the data directory are deliberately NOT in
+this skill's `allowed-tools` — those two scripts are the only paths in,
+each covered by a single Bash allowlist rule. The audit sub-agents
+(`citation-audit`,
 `consistency-review`) also write their reports via `put_data.py`, not
 the Write tool — one mechanism for all persistence keeps the allowlist
 surface minimal. Reserve the Write tool for the deliverable,

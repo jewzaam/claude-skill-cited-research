@@ -68,43 +68,75 @@ class TestDeduplicate:
 
 
 class TestSearchDdg:
-    def test_normalizes_ddgs_response(self):
-        fake_ddgs = MagicMock()
-        fake_ddgs.__enter__.return_value.text.return_value = [
-            {"href": "https://a.example", "title": "Title A", "body": "Body A"},
-            {"href": "https://b.example", "title": "Title B", "body": "Body B"},
-        ]
-        with patch.dict(
-            "sys.modules",
-            {"ddgs": MagicMock(DDGS=lambda: fake_ddgs)},
-        ):
-            results = multi_search.search_ddg("anything", limit=2)
+    """search_ddg now runs two disjoint waves and returns a coverage payload."""
 
-        assert results == [
-            {
-                "url": "https://a.example",
-                "title": "Title A",
-                "snippet": "Body A",
-                "engine": "ddg",
-            },
-            {
-                "url": "https://b.example",
-                "title": "Title B",
-                "snippet": "Body B",
-                "engine": "ddg",
-            },
+    def test_two_waves_both_contribute(self):
+        fake_ddgs = MagicMock()
+        fake_ddgs.__enter__.return_value.text.side_effect = [
+            [{"href": "https://a.example", "title": "A", "body": "Body A"}],
+            [{"href": "https://b.example", "title": "B", "body": "Body B"}],
         ]
+        with patch.dict("sys.modules", {"ddgs": MagicMock(DDGS=lambda: fake_ddgs)}):
+            payload = multi_search.search_ddg("q", limit=2, backends="e1,e2")
+
+        assert [r["url"] for r in payload["results"]] == [
+            "https://a.example",
+            "https://b.example",
+        ]
+        assert payload["results"][0]["wave"] == "A"
+        assert payload["results"][1]["wave"] == "B"
+        assert payload["coverage"]["independent_samples"] == 2
+        assert payload["coverage"]["single_wave"] is False
+
+    def test_records_candidate_backends_not_a_single_engine(self):
+        """ddgs cannot say which backend answered; the record must not claim one."""
+        fake_ddgs = MagicMock()
+        fake_ddgs.__enter__.return_value.text.side_effect = [
+            [{"href": "https://a.example", "title": "A", "body": "B"}],
+            [],
+        ]
+        with patch.dict("sys.modules", {"ddgs": MagicMock(DDGS=lambda: fake_ddgs)}):
+            payload = multi_search.search_ddg("q", limit=1, backends="brave,bing")
+
+        assert payload["results"][0]["backends"] == "brave"
+        assert "engine" not in payload["results"][0]
+
+    def test_one_wave_failing_flags_single_wave(self, capsys):
+        def _side_effect(*a, **k):
+            if _side_effect.calls == 0:
+                _side_effect.calls += 1
+                return [{"href": "https://a.example", "title": "A", "body": "B"}]
+            raise RuntimeError("blocked")
+
+        _side_effect.calls = 0
+        fake_ddgs = MagicMock()
+        fake_ddgs.__enter__.return_value.text.side_effect = _side_effect
+        with patch.dict("sys.modules", {"ddgs": MagicMock(DDGS=lambda: fake_ddgs)}):
+            payload = multi_search.search_ddg("q", limit=1, backends="e1,e2")
+
+        assert payload["coverage"]["single_wave"] is True
+        assert payload["coverage"]["independent_samples"] == 1
+        assert payload["coverage"]["waves_ok"] == ["A"]
+        assert "wave B" in capsys.readouterr().err
+
+    def test_empty_wave_counts_as_failed_not_ok(self):
+        fake_ddgs = MagicMock()
+        fake_ddgs.__enter__.return_value.text.side_effect = [[], []]
+        with patch.dict("sys.modules", {"ddgs": MagicMock(DDGS=lambda: fake_ddgs)}):
+            payload = multi_search.search_ddg("q", limit=1, backends="e1,e2")
+
+        assert payload["coverage"]["independent_samples"] == 0
+        assert len(payload["coverage"]["waves_failed"]) == 2
 
     def test_handles_missing_fields(self):
         fake_ddgs = MagicMock()
-        fake_ddgs.__enter__.return_value.text.return_value = [{}]
-        with patch.dict(
-            "sys.modules",
-            {"ddgs": MagicMock(DDGS=lambda: fake_ddgs)},
-        ):
-            results = multi_search.search_ddg("anything", limit=1)
+        fake_ddgs.__enter__.return_value.text.side_effect = [[{}], []]
+        with patch.dict("sys.modules", {"ddgs": MagicMock(DDGS=lambda: fake_ddgs)}):
+            payload = multi_search.search_ddg("anything", limit=1, backends="e1,e2")
 
-        assert results == [{"url": "", "title": "", "snippet": "", "engine": "ddg"}]
+        assert payload["results"][0]["url"] == ""
+        assert payload["results"][0]["title"] == ""
+        assert payload["results"][0]["snippet"] == ""
 
     def test_missing_dependency_exits_with_error(self, capsys):
         with patch.dict("sys.modules", {"ddgs": None}):
@@ -112,6 +144,28 @@ class TestSearchDdg:
                 multi_search.search_ddg("anything", limit=1)
         assert excinfo.value.code == 1
         assert "ddgs not installed" in capsys.readouterr().err
+
+
+class TestSplitWaves:
+    def test_interleaves_rather_than_halving(self):
+        """Contiguous halves can put every working engine in one wave."""
+        a, b = multi_search.split_waves("e1,e2,e3,e4,e5,e6")
+        assert a == ["e1", "e3", "e5"]
+        assert b == ["e2", "e4", "e6"]
+
+    def test_single_backend_leaves_second_wave_empty(self):
+        a, b = multi_search.split_waves("only")
+        assert a == ["only"]
+        assert b == []
+
+    def test_ignores_blank_entries(self):
+        a, b = multi_search.split_waves("e1, ,e2")
+        assert a + b == ["e1", "e2"]
+
+    def test_default_backends_split_into_two_usable_waves(self):
+        a, b = multi_search.split_waves(",".join(multi_search.default_backends()))
+        assert len(a) >= 2 and len(b) >= 2
+        assert not set(a) & set(b), "waves must be disjoint"
 
 
 # ---------------------------------------------------------------------------
@@ -146,43 +200,105 @@ class TestMain:
         assert excinfo.value.code == 2
 
     def test_outputs_dedup_json(self):
+        payload = {
+            "results": [
+                {"url": "https://a.example", "title": "a", "snippet": "", "wave": "A"},
+                {
+                    "url": "https://a.example",
+                    "title": "dup",
+                    "snippet": "",
+                    "wave": "B",
+                },
+            ],
+            "coverage": {"single_wave": False, "waves_ok": ["A", "B"]},
+        }
         with patch.object(
-            multi_search,
-            "ENGINE_FUNCTIONS",
-            {
-                "ddg": lambda q, limit: [
-                    {
-                        "url": "https://a.example",
-                        "title": "a",
-                        "snippet": "",
-                        "engine": "ddg",
-                    },
-                    {
-                        "url": "https://a.example",
-                        "title": "dup",
-                        "snippet": "",
-                        "engine": "ddg",
-                    },
-                ]
-            },
+            multi_search, "ENGINE_FUNCTIONS", {"ddg": lambda q, limit, **kw: payload}
         ):
             output = self._run_main(
                 ["--query", "x", "--engines", "ddg", "--limit", "5"]
             )
 
         parsed = json.loads(output)
-        assert len(parsed) == 1
-        assert parsed[0]["url"] == "https://a.example"
-        assert parsed[0]["title"] == "a"
+        assert len(parsed["results"]) == 1
+        assert parsed["results"][0]["url"] == "https://a.example"
+        assert parsed["results"][0]["title"] == "a"
+        assert parsed["coverage"]["waves_ok"] == ["A", "B"]
 
-    def test_engine_failure_warns_but_does_not_exit(self, capsys):
-        def failing(_query, _limit):
+    def test_coverage_travels_in_the_payload_not_only_stderr(self):
+        """A caller must not be able to overlook single-wave coverage."""
+        payload = {
+            "results": [
+                {"url": "https://a.example", "title": "a", "snippet": "", "wave": "A"}
+            ],
+            "coverage": {
+                "single_wave": True,
+                "waves_ok": ["A"],
+                "wave_a_backends": "e1",
+                "wave_b_backends": "e2",
+            },
+        }
+        with patch.object(
+            multi_search, "ENGINE_FUNCTIONS", {"ddg": lambda q, limit, **kw: payload}
+        ):
+            output = self._run_main(["--query", "x"])
+
+        assert json.loads(output)["coverage"]["single_wave"] is True
+
+    def test_empty_results_exit_nonzero(self, capsys):
+        payload = {"results": [], "coverage": {"single_wave": False, "waves_ok": []}}
+        with patch.object(
+            multi_search, "ENGINE_FUNCTIONS", {"ddg": lambda q, limit, **kw: payload}
+        ):
+            with pytest.raises(SystemExit) as excinfo:
+                self._run_main(["--query", "x"])
+        assert excinfo.value.code == 1
+        assert "no results from any wave" in capsys.readouterr().err
+
+    def test_total_engine_failure_exits_nonzero(self, capsys):
+        """An empty array on exit 0 would read as 'ran fine, found nothing'.
+
+        The coordinator would then proceed on single-engine results without
+        noticing — the exact bias this script exists to reduce.
+        """
+
+        def failing(_query, _limit, **_kw):
             raise RuntimeError("network down")
 
         with patch.object(multi_search, "ENGINE_FUNCTIONS", {"ddg": failing}):
-            output = self._run_main(["--query", "x"])
+            with pytest.raises(SystemExit) as excinfo:
+                self._run_main(["--query", "x"])
 
-        assert json.loads(output) == []
+        assert excinfo.value.code == 1
+        err = capsys.readouterr().err
+        assert "ddg search failed" in err
+        assert "Search is unavailable" in err
+
+    def test_partial_engine_failure_still_succeeds(self, capsys):
+        """One working engine is a usable result, not a failed run."""
+
+        def failing(_query, _limit, **_kw):
+            raise RuntimeError("network down")
+
+        def working(_query, _limit, **_kw):
+            return {
+                "results": [
+                    {
+                        "url": "https://a.example",
+                        "title": "a",
+                        "snippet": "",
+                        "wave": "A",
+                    }
+                ],
+                "coverage": {"single_wave": False, "waves_ok": ["A", "B"]},
+            }
+
+        engines = {"ddg": failing, "other": working}
+        with patch.object(multi_search, "ENGINE_FUNCTIONS", engines):
+            with patch.object(multi_search, "SUPPORTED_ENGINES", {"ddg", "other"}):
+                output = self._run_main(["--query", "x", "--engines", "ddg,other"])
+
+        assert len(json.loads(output)["results"]) == 1
         assert "ddg search failed" in capsys.readouterr().err
 
 
@@ -201,3 +317,201 @@ def test_live_ddg_returns_results():
     assert first["engine"] == "ddg"
     assert isinstance(first["title"], str)
     assert isinstance(first["snippet"], str)
+
+
+def test_search_ddg_passes_one_wave_per_call():
+    """Each wave is a separate call — that is what makes the samples independent."""
+    fake_ddgs = MagicMock()
+    fake_ddgs.__enter__.return_value.text.return_value = []
+    with patch.dict("sys.modules", {"ddgs": MagicMock(DDGS=lambda: fake_ddgs)}):
+        multi_search.search_ddg("q", limit=5, backends="duckduckgo,brave")
+    calls = fake_ddgs.__enter__.return_value.text.call_args_list
+    assert len(calls) == 2, "both waves must be queried"
+    assert calls[0].kwargs["backend"] == "duckduckgo"
+    assert calls[1].kwargs["backend"] == "brave"
+    assert calls[0].kwargs["max_results"] == 5
+
+
+def test_default_backends_are_multiple_engines():
+    """A single-engine default would silently reintroduce the bias."""
+    assert len(multi_search.default_backends()) >= 3
+    assert "auto" not in multi_search.default_backends()
+
+
+# ---------------------------------------------------------------------------
+# run_health() — per-backend probe
+
+
+def _registry(*names):
+    """Patch ddgs.engines so text_backends() returns exactly `names`."""
+    fake = MagicMock()
+    fake.ENGINES = {"text": {n: object() for n in names}}
+    return {"ddgs.engines": fake}
+
+
+class TestRunHealth:
+    def test_distinct_backends_are_alive(self, capsys):
+        """Each backend returning its own URLs means isolation is real."""
+
+        def _per_backend(*a, **k):
+            return [{"href": f"https://{k['backend']}.example"}]
+
+        fake_ddgs = MagicMock()
+        fake_ddgs.__enter__.return_value.text.side_effect = _per_backend
+        mods = {"ddgs": MagicMock(DDGS=lambda: fake_ddgs), **_registry("alpha", "beta")}
+        with patch.dict("sys.modules", mods):
+            code = multi_search.run_health()
+        out = capsys.readouterr().out
+        assert code == 0
+        assert "suggested --backends" in out
+        assert "alpha" in out and "beta" in out
+
+    def test_backend_matching_sentinel_is_flagged_not_counted_alive(self, capsys):
+        """A backend echoing the auto-selection pool is a false positive.
+
+        Regression: an unregistered `bing` passed the old probe because ddgs
+        silently answered it with the full auto pool.
+        """
+        fake_ddgs = MagicMock()
+        fake_ddgs.__enter__.return_value.text.return_value = [{"href": "https://same"}]
+        mods = {"ddgs": MagicMock(DDGS=lambda: fake_ddgs), **_registry("alpha", "beta")}
+        with patch.dict("sys.modules", mods):
+            code = multi_search.run_health()
+        captured = capsys.readouterr()
+        assert code == 1, "no isolated backend means no two waves"
+        assert "FALLBACK" in captured.out
+        assert "not isolated" in captured.err
+
+    def test_fewer_than_two_alive_returns_one(self, capsys):
+        """Two waves cannot be formed from one engine — that must be an error."""
+
+        def _one_only(*a, **k):
+            if k.get("backend") == "duckduckgo":
+                return [{"href": "https://a"}]
+            raise RuntimeError("blocked")
+
+        fake_ddgs = MagicMock()
+        fake_ddgs.__enter__.return_value.text.side_effect = _one_only
+        mods = {
+            "ddgs": MagicMock(DDGS=lambda: fake_ddgs),
+            **_registry("duckduckgo", "brave"),
+        }
+        with patch.dict("sys.modules", mods):
+            code = multi_search.run_health()
+        assert code == 1
+        assert "two independent waves" in capsys.readouterr().err
+
+    def test_empty_result_counts_as_dead(self, capsys):
+        fake_ddgs = MagicMock()
+        fake_ddgs.__enter__.return_value.text.return_value = []
+        mods = {"ddgs": MagicMock(DDGS=lambda: fake_ddgs), **_registry("alpha", "beta")}
+        with patch.dict("sys.modules", mods):
+            code = multi_search.run_health()
+        assert code == 1
+        assert "EMPTY" in capsys.readouterr().out
+
+    def test_missing_dependency_returns_one(self, capsys):
+        with patch.dict("sys.modules", {"ddgs": None}):
+            code = multi_search.run_health()
+        assert code == 1
+        assert "ddgs not installed" in capsys.readouterr().err
+
+    def test_health_flag_short_circuits_query_requirement(self):
+        with patch.object(multi_search, "run_health", lambda: 0):
+            with patch.object(sys, "argv", ["multi_search", "--health"]):
+                with pytest.raises(SystemExit) as excinfo:
+                    multi_search.main()
+        assert excinfo.value.code == 0
+
+    def test_query_required_without_health(self):
+        with patch.object(sys, "argv", ["multi_search"]):
+            with pytest.raises(SystemExit) as excinfo:
+                multi_search.main()
+        assert excinfo.value.code == 2
+
+
+class TestWaveContribution:
+    def test_counts_unique_urls_per_wave(self):
+        results = [
+            {"url": "https://a", "wave": "A"},
+            {"url": "https://b", "wave": "A"},
+            {"url": "https://c", "wave": "B"},
+        ]
+        assert multi_search.wave_contribution(results) == {"A": 2, "B": 1}
+
+    def test_wave_adding_nothing_is_absent_from_counts(self):
+        """A wave whose results all dedup away broadened nothing."""
+        deduped = [{"url": "https://a", "wave": "A"}]
+        assert multi_search.wave_contribution(deduped) == {"A": 1}
+
+    def test_main_flags_complete_overlap_between_healthy_waves(self, capsys):
+        payload = {
+            "results": [
+                {"url": "https://a", "title": "a", "snippet": "", "wave": "A"},
+                {"url": "https://a", "title": "dup", "snippet": "", "wave": "B"},
+            ],
+            "coverage": {
+                "single_wave": False,
+                "waves_ok": ["A", "B"],
+                "returned_by_wave": {"A": 1, "B": 1},
+            },
+        }
+        with patch.object(
+            multi_search, "ENGINE_FUNCTIONS", {"ddg": lambda q, limit, **kw: payload}
+        ):
+            buf = io.StringIO()
+            with patch.object(sys, "argv", ["multi_search", "--query", "x"]):
+                with redirect_stdout(buf):
+                    multi_search.main()
+        parsed = json.loads(buf.getvalue())
+        assert parsed["coverage"]["unique_by_wave"] == {"A": 1}
+        assert parsed["coverage"]["waves_adding_unique"] == ["A"]
+        assert "overlapped completely" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# Backend registry — read from ddgs, never hardcoded
+
+
+class TestBackendRegistry:
+    def test_text_backends_come_from_the_library(self):
+        fake = MagicMock()
+        fake.ENGINES = {"text": {"alpha": 1, "beta": 2}, "news": {"gamma": 3}}
+        with patch.dict("sys.modules", {"ddgs.engines": fake}):
+            assert multi_search.text_backends() == ["alpha", "beta"]
+
+    def test_text_backends_empty_when_ddgs_absent(self):
+        with patch.dict("sys.modules", {"ddgs.engines": None}):
+            assert multi_search.text_backends() == []
+
+    def test_default_excludes_encyclopedias(self):
+        fake = MagicMock()
+        fake.ENGINES = {"text": {"brave": 1, "wikipedia": 2, "grokipedia": 3}}
+        with patch.dict("sys.modules", {"ddgs.engines": fake}):
+            assert multi_search.default_backends() == ["brave"]
+
+    def test_validate_rejects_names_not_registered_for_text(self):
+        """ddgs silently auto-selects for unknown names — catch them first."""
+        fake = MagicMock()
+        fake.ENGINES = {"text": {"brave": 1, "yandex": 2}}
+        with patch.dict("sys.modules", {"ddgs.engines": fake}):
+            assert multi_search.validate_backends(["brave", "bing"]) == ["bing"]
+            assert multi_search.validate_backends(["brave", "yandex"]) == []
+
+    def test_validate_is_a_noop_without_ddgs(self):
+        with patch.dict("sys.modules", {"ddgs.engines": None}):
+            assert multi_search.validate_backends(["anything"]) == []
+
+    def test_main_rejects_unregistered_backend(self, capsys):
+        fake = MagicMock()
+        fake.ENGINES = {"text": {"brave": 1}}
+        with patch.dict("sys.modules", {"ddgs.engines": fake}):
+            with patch.object(
+                sys, "argv", ["multi_search", "--query", "x", "--backends", "bing"]
+            ):
+                with pytest.raises(SystemExit) as excinfo:
+                    multi_search.main()
+        assert excinfo.value.code == 1
+        err = capsys.readouterr().err
+        assert "not registered as ddgs text backends: bing" in err
+        assert "falls back to auto-selection" in err

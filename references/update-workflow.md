@@ -85,7 +85,8 @@ For approved dimensions, proceed through Phases 1-5 with these modifications:
   2. Collect the combined URL set: existing citation URLs for in-scope
      dimensions + newly discovered URLs
   3. Deduplicate by exact URL
-  4. Fetch the full set via WebFetch (user approves)
+  4. Fetch the full set via the preflight-established path (see
+     `SKILL.md §Phase 1`)
   5. Compare fetched content against the "Brief description of specific data
      extracted" recorded in `citations.md` to detect content drift
 

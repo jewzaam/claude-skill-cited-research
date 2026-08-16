@@ -40,7 +40,11 @@ citation:
      specific claim — the claim goes beyond what the source actually says,
      or the source is tangentially related but doesn't entail the assertion
    - INACCURATE: Source exists but claim misrepresents it (explain how)
-   - INACCESSIBLE: Fetched file shows FAILED status (404, permission denied)
+   - INACCESSIBLE: Fetched file shows FAILED status (404, permission
+     denied), or there is no fetched file for the URL at all — a claim
+     whose only support is a search result is unverified by definition,
+     because nobody read the page. Grade it INACCESSIBLE, never VERIFIED,
+     no matter how confidently the document states it
    - DRIFT: Source is accessible but the cited data is no longer present or
      has changed materially — quote both the original extraction description
      from citations.md and what the source currently says
@@ -60,7 +64,22 @@ have graded INACCURATE? An interpretation you accepted too readily? Revise
 your grades accordingly, then return the final output.
 
 Output format: a markdown file with a summary table, then one section per
-citation with grade, evidence, and notes. End with a count of each grade.
+citation with grade, evidence, and notes.
+
+End with a machine-readable ledger — a section headed exactly
+`## Grade Ledger` containing one line per citation you checked:
+
+```
+## Grade Ledger
+[12] VERIFIED
+[28] INACCURATE
+[55] PARTIAL
+```
+
+Grades must be one of VERIFIED, PARTIAL, INACCURATE, INACCESSIBLE, NOT
+FOUND. Include **every** citation you checked, including the ones that
+passed — a run report counts this ledger, and citations you verified but
+omitted here are indistinguishable from citations you never looked at.
 
 Persist the report under output filename `citation-audit.md` via
 the `put_data.py` wrapper — see
