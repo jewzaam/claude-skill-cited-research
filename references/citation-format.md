@@ -71,6 +71,28 @@ history.
 If no claims are removed during an update run, do not create or modify the
 retraction ledger.
 
+## Tertiary Sources (Encyclopedias)
+
+Wikipedia, Grokipedia and similar reference works are **mined, not cited**.
+`fetch_url.py` extracts an encyclopedia article's citation links into a
+`<name>.refs` sidecar automatically; fetch those URLs and cite the
+underlying source.
+
+Cite the encyclopedia itself only when it is the sole support available, and
+then mark it plainly:
+
+```markdown
+**[N]** "Article Title." *Wikipedia*, n.d.
+<https://en.wikipedia.org/wiki/...>
+**Tier:** 3 (tertiary reference)
+Data extracted: [specific details].
+Note: tertiary source; the primary source for this claim was not reached.
+```
+
+Grokipedia is AI-generated. Do not cite it directly under any circumstance —
+mine its references and cite those, each of which must independently survive
+fetching and the citation audit.
+
 ## Rules
 
 1. **Number sequentially.** Do not skip numbers.

@@ -48,8 +48,12 @@ format: install-dev  ## Format code with black
 format-check: install-dev  ## Check formatting without modifying files
 	$(PYTHON) -m black --check $(PACKAGE_NAME) tests
 
+# -j 1 disables flake8's process pool. In a rootless container without POSIX
+# semaphores, multiprocessing.Pool raises PermissionError and the target fails
+# before linting anything. This repo is ~11 files, so serial linting costs
+# nothing measurable and works everywhere.
 lint: install-dev  ## Lint with flake8
-	$(PYTHON) -m flake8 --max-line-length=88 --extend-ignore=E203,W503 $(PACKAGE_NAME) tests
+	$(PYTHON) -m flake8 -j 1 --max-line-length=88 --extend-ignore=E203,W503 $(PACKAGE_NAME) tests
 
 typecheck: install-dev  ## Type check with mypy
 	$(PYTHON) -m mypy $(PACKAGE_NAME)

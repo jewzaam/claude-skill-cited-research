@@ -4,24 +4,37 @@
 
 """Multi-engine search CLI.
 
-Queries multiple search engines and returns a deduplicated JSON list of results.
-Designed for use by the cited-research skill coordinator to broaden the URL pool
-beyond a single search engine.
+The cited-research skill's only sanctioned search path. Queries two disjoint
+waves of search backends and returns their merged, deduplicated results.
+
+Why two waves. `ddgs` fronts several engines, but a single call fills
+`max_results` from whichever backend answers first — measured: one backend
+alone and all eight together both returned 10 of 10 requested results. So
+naming eight engines in one call buys far less diversity than it appears to.
+Splitting them into two disjoint waves and querying each separately forces
+two independent engine populations to contribute, which is the property this
+script exists to provide.
+
+The split is not optional and has no disabling flag. Coverage is reported in
+the output payload, not only on stderr, so a caller cannot overlook a run
+that silently collapsed to one wave.
 
 Usage (from the skill install directory, via its own venv):
     ~/.claude/skills/cited-research/.venv/bin/python \\
         ~/.claude/skills/cited-research/scripts/multi_search.py \\
-        --query "..." --engines ddg --limit 10
+        --query "..." --limit 10
+
+    # probe which backends are alive, one request each
+    ... multi_search.py --health
 
 For local development from the repo root:
     make test-live
     .venv/bin/python scripts/multi_search.py --query "..." --limit 10
 
-Engines:
-    ddg — DuckDuckGo (via the ddgs library, no API key required)
-
 Output:
-    JSON array of {url, title, snippet, engine} objects, deduplicated by URL.
+    JSON object:
+      {"results": [{url, title, snippet, wave, backends}, ...],
+       "coverage": {...}}
 """
 
 import argparse
@@ -30,11 +43,88 @@ import sys
 
 SUPPORTED_ENGINES = {"ddg"}
 
+# Engines excluded from the default set. They are real text backends, but
+# an encyclopedia is not a comparable source to a web index for most
+# research questions — keep them available via --backends, out of the
+# default.
+NON_WEB_BACKENDS = frozenset({"wikipedia", "grokipedia"})
 
-def search_ddg(query: str, limit: int) -> list[dict]:
-    """Search DuckDuckGo and return normalized results."""
+
+def text_backends() -> list[str]:
+    """Every text-search backend ddgs currently registers.
+
+    Read from the library at runtime rather than hardcoded. ddgs adds and
+    removes engines between releases, and a stale hardcoded list silently
+    narrows coverage — or worse, names an engine that is not registered for
+    this category (see validate_backends).
+    """
     try:
-        from ddgs import DDGS
+        from ddgs.engines import ENGINES
+    except ImportError:
+        return []
+    return sorted(ENGINES.get("text", {}).keys())
+
+
+def default_backends() -> list[str]:
+    """Registered text backends minus the non-web ones."""
+    return [b for b in text_backends() if b not in NON_WEB_BACKENDS]
+
+
+def validate_backends(requested: list[str]) -> list[str]:
+    """Return the names ddgs does not register for text search.
+
+    This check exists because ddgs **silently falls back to auto-selection
+    when a backend name is unknown for the category** — verified: a bogus
+    name returned the same result set as `bing`, which is registered for
+    images and news but not text. An unnoticed typo or a wrong-category name
+    therefore produces results that look like an isolated engine but are
+    actually the full auto pool, which destroys the wave split's guarantee
+    without any error surfacing.
+    """
+    known = set(text_backends())
+    if not known:  # ddgs unavailable; validation is not possible
+        return []
+    return [b for b in requested if b not in known]
+
+
+def split_waves(backends: str) -> tuple[list[str], list[str]]:
+    """Split a backend list into two disjoint waves, interleaved.
+
+    Interleaving (rather than halving) spreads correlated failures. Engines
+    tend to block in clusters, and a contiguous split can put every working
+    engine in one wave, which would defeat the purpose.
+    """
+    names = [b.strip() for b in backends.split(",") if b.strip()]
+    return names[0::2], names[1::2]
+
+
+def _query_wave(query: str, limit: int, wave_backends: list[str], label: str) -> list:
+    """Run one wave. Returns normalized records; raises on total wave failure."""
+    from ddgs import DDGS
+
+    joined = ",".join(wave_backends)
+    with DDGS() as ddgs:
+        hits = ddgs.text(query, max_results=limit, backend=joined)
+    return [
+        {
+            "url": r.get("href", ""),
+            "title": r.get("title", ""),
+            "snippet": r.get("body", ""),
+            "wave": label,
+            # ddgs does not report which backend answered, so this records
+            # the candidate set for the wave rather than claiming a single
+            # engine. Do not relabel it as one engine — that would be a
+            # provenance claim the library cannot support.
+            "backends": joined,
+        }
+        for r in hits
+    ]
+
+
+def search_ddg(query: str, limit: int, backends: str = "") -> dict:
+    """Search both waves and return {"results": [...], "coverage": {...}}."""
+    try:
+        import ddgs  # noqa: F401
     except ImportError:
         print(
             "Error: ddgs not installed. Run: python -m pip install ddgs",
@@ -42,18 +132,71 @@ def search_ddg(query: str, limit: int) -> list[dict]:
         )
         sys.exit(1)
 
-    results = []
-    with DDGS() as ddgs:
-        for r in ddgs.text(query, max_results=limit):
-            results.append(
+    backends = backends or ",".join(default_backends())
+    wave_a, wave_b = split_waves(backends)
+    waves = [("A", wave_a), ("B", wave_b)]
+    results: list[dict] = []
+    ok: list[str] = []
+    failed: list[dict] = []
+    returned_by_wave: dict[str, int] = {}
+
+    for label, members in waves:
+        if not members:
+            failed.append({"wave": label, "backends": "", "error": "no backends"})
+            continue
+        try:
+            hits = _query_wave(query, limit, members, label)
+        except Exception as e:  # noqa: BLE001 — any engine error degrades one wave
+            failed.append(
+                {"wave": label, "backends": ",".join(members), "error": str(e)[:200]}
+            )
+            print(
+                f"Warning: wave {label} ({','.join(members)}) failed: {e}",
+                file=sys.stderr,
+            )
+            continue
+        if hits:
+            ok.append(label)
+            returned_by_wave[label] = len(hits)
+            results.extend(hits)
+        else:
+            failed.append(
                 {
-                    "url": r.get("href", ""),
-                    "title": r.get("title", ""),
-                    "snippet": r.get("body", ""),
-                    "engine": "ddg",
+                    "wave": label,
+                    "backends": ",".join(members),
+                    "error": "no results returned",
                 }
             )
-    return results
+
+    coverage = {
+        "waves_ok": ok,
+        "waves_failed": failed,
+        "wave_a_backends": ",".join(wave_a),
+        "wave_b_backends": ",".join(wave_b),
+        "independent_samples": len(ok),
+        # True when only one wave contributed. The caller must disclose this
+        # as reduced coverage rather than treating the results as
+        # multi-engine.
+        "single_wave": len(ok) == 1,
+        "returned_by_wave": returned_by_wave,
+    }
+    return {"results": results, "coverage": coverage}
+
+
+def wave_contribution(results: list[dict]) -> dict:
+    """Count how many *unique* URLs each wave contributed after dedup.
+
+    A wave can answer successfully and still add nothing new — its results
+    may all duplicate the other wave's. That is the difference between two
+    engines running and two engines actually broadening the pool, and it is
+    invisible unless measured. Observed in practice: two healthy waves where
+    the second contributed zero unique URLs.
+    """
+    counts: dict[str, int] = {}
+    for r in results:
+        label = r.get("wave", "?")
+        counts[label] = counts.get(label, 0) + 1
+    return counts
 
 
 ENGINE_FUNCTIONS = {
@@ -73,11 +216,84 @@ def deduplicate(results: list[dict]) -> list[dict]:
     return deduped
 
 
+def run_health(limit: int = 3) -> int:
+    """Probe every registered text backend individually.
+
+    Also runs a sentinel probe with a deliberately unregistered name. ddgs
+    answers such a name by falling back to auto-selection, so the sentinel's
+    result set is what "no isolation" looks like. Any backend returning the
+    same URLs as the sentinel is not actually being queried in isolation,
+    and reporting it as healthy would be a false positive — which is exactly
+    how an unregistered `bing` previously passed this probe.
+
+    Returns a process exit code.
+    """
+    try:
+        from ddgs import DDGS
+    except ImportError:
+        print("Error: ddgs not installed.", file=sys.stderr)
+        return 1
+
+    backends = text_backends()
+    query = "test query"
+
+    def _urls(backend: str) -> list[str] | None:
+        try:
+            with DDGS() as ddgs:
+                hits = ddgs.text(query, max_results=limit, backend=backend)
+            return [h.get("href", "") for h in hits]
+        except Exception as e:  # noqa: BLE001
+            print(f"{backend:12} FAIL  {type(e).__name__}: {str(e)[:70]}")
+            return None
+
+    sentinel = _urls("zz-unregistered-sentinel")
+    sentinel_set = set(sentinel or [])
+    if sentinel:
+        print(
+            f"{'(sentinel)':12} fallback pool returned {len(sentinel)} results — "
+            "backends matching it are not isolated"
+        )
+
+    alive, shadowed = [], []
+    for backend in backends:
+        urls = _urls(backend)
+        if urls is None:
+            continue
+        if not urls:
+            print(f"{backend:12} EMPTY")
+            continue
+        if sentinel_set and set(urls) == sentinel_set:
+            shadowed.append(backend)
+            print(f"{backend:12} FALLBACK  (identical to sentinel — not isolated)")
+            continue
+        alive.append(backend)
+        print(f"{backend:12} OK    ({len(urls)} results)")
+
+    total = len(backends)
+    print(f"\nalive: {len(alive)}/{total} — {','.join(alive) or 'none'}")
+    if shadowed:
+        print(
+            f"not isolated: {','.join(shadowed)} — these returned the "
+            "auto-selection pool rather than their own results",
+            file=sys.stderr,
+        )
+    if len(alive) < 2:
+        print(
+            "Fewer than two backends are alive, so two independent waves "
+            "cannot be formed. Search coverage will be single-wave at best.",
+            file=sys.stderr,
+        )
+        return 1
+    usable = [b for b in alive if b not in NON_WEB_BACKENDS]
+    print(f"suggested --backends {','.join(usable or alive)}")
+    return 0
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Multi-engine search for cited-research skill"
     )
-    parser.add_argument("--query", required=True, help="Search query string")
+    parser.add_argument("--query", help="Search query string")
     parser.add_argument(
         "--engines",
         default="ddg",
@@ -87,9 +303,26 @@ def main():
         "--limit",
         type=int,
         default=10,
-        help="Max results per engine (default: 10)",
+        help="Max results per wave (default: 10)",
+    )
+    parser.add_argument(
+        "--backends",
+        default="",
+        help="Comma-delimited ddgs text backends (default: every registered "
+        "text backend except encyclopedias). Unknown names are rejected — "
+        "ddgs silently falls back to auto-selection for them.",
+    )
+    parser.add_argument(
+        "--health",
+        action="store_true",
+        help="Probe each known backend individually and exit",
     )
     args = parser.parse_args()
+
+    if args.health:
+        sys.exit(run_health())
+    if not args.query:
+        parser.error("--query is required unless --health")
 
     engines = [e.strip() for e in args.engines.split(",")]
     unknown = set(engines) - SUPPORTED_ENGINES
@@ -98,17 +331,82 @@ def main():
         print(f"Supported: {', '.join(sorted(SUPPORTED_ENGINES))}", file=sys.stderr)
         sys.exit(1)
 
-    all_results = []
+    requested = [b.strip() for b in args.backends.split(",") if b.strip()]
+    if requested:
+        unknown_backends = validate_backends(requested)
+        if unknown_backends:
+            print(
+                "Error: not registered as ddgs text backends: "
+                f"{', '.join(unknown_backends)}",
+                file=sys.stderr,
+            )
+            print(f"Valid text backends: {', '.join(text_backends())}", file=sys.stderr)
+            print(
+                "Passing an unregistered name is not a no-op: ddgs silently "
+                "falls back to auto-selection, so the wave would not be an "
+                "isolated sample.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+    all_results: list[dict] = []
+    coverage: dict = {}
+    failures = 0
     for engine in engines:
         try:
-            results = ENGINE_FUNCTIONS[engine](args.query, args.limit)
-            all_results.extend(results)
-        except Exception as e:
+            # `backends` is ddgs-specific — a future engine with its own API
+            # would not take it, so it is passed only to the engine that
+            # understands it rather than forced into the shared signature.
+            extra = {"backends": args.backends} if engine == "ddg" else {}
+            payload = ENGINE_FUNCTIONS[engine](args.query, args.limit, **extra)
+            all_results.extend(payload["results"])
+            coverage = payload["coverage"]
+        except Exception as e:  # noqa: BLE001
+            failures += 1
             print(f"Warning: {engine} search failed: {e}", file=sys.stderr)
 
     deduped = deduplicate(all_results)
-    json.dump(deduped, sys.stdout, indent=2)
+    if coverage:
+        coverage["unique_by_wave"] = wave_contribution(deduped)
+        # A wave that answered but added no unique URL broadened nothing.
+        coverage["waves_adding_unique"] = [
+            w for w, n in coverage["unique_by_wave"].items() if n > 0
+        ]
+    json.dump({"results": deduped, "coverage": coverage}, sys.stdout, indent=2)
     print()  # trailing newline
+
+    # Exit non-zero when nothing came back. An empty result on exit 0 is
+    # indistinguishable from "the engines ran and found nothing", so the
+    # coordinator would proceed on a pool it believes is multi-engine.
+    if failures == len(engines) or not deduped:
+        print(
+            "Error: no results from any wave. Search is unavailable — stop and "
+            "report this rather than proceeding on whatever URLs are at hand.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    # Degraded, not fatal: one wave answered, so the results are usable but
+    # are NOT two independent samples. Loud on stderr and flagged in the
+    # payload so it survives into the caller's context either way.
+    adding = coverage.get("waves_adding_unique")
+    if adding is not None and len(adding) < 2 and not coverage.get("single_wave"):
+        print(
+            f"Warning: both waves answered but only wave(s) {adding} contributed "
+            f"unique URLs (returned {coverage.get('returned_by_wave')}). The "
+            "engines overlapped completely on this query — effective coverage "
+            "is single-sample despite two waves running.",
+            file=sys.stderr,
+        )
+
+    if coverage.get("single_wave"):
+        print(
+            f"Warning: only wave {coverage['waves_ok'][0]} returned results "
+            f"({coverage['wave_a_backends']} / {coverage['wave_b_backends']}). "
+            "Coverage is single-wave, not two independent samples — disclose "
+            "this in the deliverable's Limitations section.",
+            file=sys.stderr,
+        )
 
 
 if __name__ == "__main__":

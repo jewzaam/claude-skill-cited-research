@@ -72,7 +72,7 @@ and the user about what will be researched and how.
 
 ### Step 1: Dimension Discovery
 
-Decompose the user's request into research dimensions before any WebSearch calls.
+Decompose the user's request into research dimensions before running any searches.
 Present these to the user and wait for approval.
 
 Include both directly requested dimensions and recommended additions that would
@@ -157,14 +157,39 @@ Exit plan mode only after the user approves.
 
 ### Principles
 
-1. **Web sources only.** Every number, measurement, date, or factual statement
-   must come from a URL visited in-session via WebSearch or WebFetch.
+1. **Web sources only, and search is not a source.** Every number,
+   measurement, date, or factual statement must come from the text of a page
+   fetched in-session — via `WebFetch`, or `scripts/fetch_url.py` when
+   `WebFetch` is unavailable (see §Preflight under Coordinator Protocol).
 
-2. **Parallel where possible.** Launch one research sub-agent per dimension (or
+   Search is for *finding* pages, not for sourcing claims. Search results may
+   contribute a URL and a verbatim snippet quote. They may never contribute a
+   claim.
+
+2. **Do not use WebSearch. Search runs through `scripts/multi_search.py`.**
+   This is a hard rule, not a preference.
+
+   WebSearch returns a model-synthesized answer alongside its links. That
+   prose is an interpretation of results, not source text, and it is a bias
+   vector with a feedback loop: it shapes which URLs get fetched and which
+   claims get written, then hides inside a citation to a page nobody read.
+   It has also been observed to return *no* per-URL verbatim snippets at all,
+   which leaves an agent nothing quotable and invites paraphrase.
+
+   `multi_search.py` returns raw `{url, title, snippet, engine}` records
+   scraped from engine result pages — the snippet is the engine's extract of
+   the page, not a model's reading of it — and it carries no per-session call
+   budget. It is the only sanctioned search path.
+
+   If a run is somehow forced onto WebSearch, every claim touching those
+   results must be disclosed as search-derived in the deliverable's
+   Limitations section.
+
+3. **Parallel where possible.** Launch one research sub-agent per dimension (or
    group of related dimensions). Four agents in parallel take the same wall-clock
    time as one.
 
-3. **Primary sources preferred.** Assign quality tiers to sources and prefer
+4. **Primary sources preferred.** Assign quality tiers to sources and prefer
    higher tiers when conflicts arise:
    - **Tier 1:** Peer-reviewed papers, government/institutional reports
    - **Tier 2:** Manufacturer specs, established reference sites, university
@@ -176,7 +201,7 @@ Exit plan mode only after the user approves.
    See `references/research-basis.md` §Source Quality and Weighting for the
    evidence behind these tiers.
 
-4. **Consider source recency relative to topic.** For fast-moving domains
+5. **Consider source recency relative to topic.** For fast-moving domains
    (for example AI, cloud infrastructure, security), prefer sources published within the
    last 2 years — the landscape changes quickly enough that older findings may
    be superseded. For stable domains (for example physics, music theory, established
@@ -184,33 +209,63 @@ Exit plan mode only after the user approves.
    When mixing source ages, note the publication year alongside each claim so
    readers can assess currency.
 
-5. **Record everything immediately.** Research agents must include every URL,
+6. **Record everything immediately.** Research agents must include every URL,
    claim, and exact source wording in their structured response. The main
    thread cannot recover data that agents omit from their output.
 
-6. **Acknowledge gaps.** If a data point cannot be found after 3+ distinct
+7. **Acknowledge gaps.** If a data point cannot be found after 3+ distinct
    queries, state explicitly that this data point is unavailable. Do not invent
    a plausible number.
 
-7. **Welcome bonus sources.** Research agents often discover relevant sources
+8. **Welcome bonus sources.** Research agents often discover relevant sources
    not in the plan. Encourage this — unanticipated sources frequently strengthen
    the deliverable.
 
 ### Coordinator Protocol
 
-Main thread owns every WebFetch call and every file write — that's
-the security boundary (the user approves each outbound fetch).
-Sub-agents return structured results; the main thread acts on them.
-Iterative loop, capped at 3:
+Main thread owns every fetch and every file write — that's the security
+boundary (the user approves the outbound fetch rule once, and every
+requested URL is logged host-side). Sub-agents return structured results;
+the main thread acts on them. Iterative loop, capped at 3:
 
 ```
 for each iteration (max 3):
     1. Main thread dispatches agents with available context
     2. Agents return structured results (findings + fetch requests)
-    3. Main thread WebFetches requested URLs (user approves)
+    3. Main thread fetches requested URLs (WebFetch, or fetch_url.py)
     4. If agents reported confidence > 0.8 with no new URLs: stop
     5. Otherwise: feed fetched content back to agents for next iteration
 ```
+
+**Log every agent dispatch.** Immediately after each batch of agents
+returns, append one tab-separated line per agent to the run's `agents.tsv`
+via `put_data.py`:
+
+```
+<name>	<mode>	ok
+<name>	<mode>	error: <short reason>
+```
+
+An agent that returned nothing, timed out, or hit a tool budget is a loss of
+signal, and it is invisible afterwards unless recorded here. The run report
+counts this file.
+
+**Preflight.** Before the first page read of a run, establish which
+retrieval path works:
+
+1. Try `WebFetch` on the first URL. If it succeeds, use it for the whole
+   run and persist each page with `put_data.py`.
+2. If it fails with `Socket is closed`, this is a sandbox. Check the
+   host-side fetch service with `scripts/fetch_url.py --check`.
+3. If that exits non-zero, stop and tell the operator. No pages can be
+   read, and that must surface before agents are dispatched rather than
+   as a wall of failures afterward. Do not route around it — there is no
+   other egress for arbitrary hosts.
+
+Invocation and exit codes are in
+[`references/data-persistence.md`](references/data-persistence.md); the
+service itself is documented at
+<https://github.com/jewzaam/openshell-sandbox/blob/main/docs/fetch-service.md>.
 
 ### Model Assignment
 
@@ -220,65 +275,145 @@ verification on `sonnet`, deep extraction and synthesis on `opus`.
 See `references/research-basis.md` §Model Assignment by Agent Role
 for the evidence-backed rationale per role.
 
-**Iteration 1 — Discovery:**
-- Dispatch one `research-discovery` agent per dimension. The agent's
-  frontmatter defines model, tools, and background mode. Provide
-  DIMENSION, PROJECT_DESCRIPTION, and SEARCH_QUERIES in the invocation
-  prompt
-- Agent returns: URL manifest, preliminary findings from search snippets,
-  confidence score, open questions
-- **Counter-Discovery** (unless user chose "Skip" in Phase 0 Step 4):
-  dispatch one `research-counter-discovery` agent per dimension alongside
-  the Discovery agent. Provide DIMENSION, PROJECT_DESCRIPTION,
-  RESEARCH_QUESTION, and COUNTER_SEARCH_QUERIES in the invocation prompt.
-  Counter-Discovery agents seek contradicting evidence, failure cases, and
-  minority viewpoints. Their URLs merge into the same manifest pool — no
-  tagging distinguishes counter-sources from supporting sources. If the
-  user chose "Find and gate" and a Counter-Discovery agent returns
-  confidence < 0.3 with no URLs, surface this to the user before
-  proceeding to iteration 2
-- Main thread collects all URL manifests across all agents (Discovery +
-  Counter-Discovery)
+**Iteration 1 — Discovery (three steps, coordinator executes all search):**
 
-**Multi-engine augmentation (between iterations 1 and 2):**
-- After collecting discovery agent URL manifests, the coordinator runs
-  `scripts/multi_search.py` for each dimension's top search queries to
-  pull results from DuckDuckGo (and any additional engines configured).
-  The script lives with the installed skill; invoke it by absolute path
-  so it works regardless of the current working directory:
+Sub-agents plan queries and triage results. The coordinator runs every
+query. No agent has a search tool.
 
-  Linux/macOS:
-  ```
-  ~/.claude/skills/cited-research/.venv/bin/python \
-      ~/.claude/skills/cited-research/scripts/multi_search.py \
-      --query "..." --limit 10
-  ```
+*Step 1 — agents propose queries.* Dispatch one `research-discovery` agent
+per dimension in MODE: propose, with DIMENSION, PROJECT_DESCRIPTION and
+KNOWN_GAPS. Each returns 8–15 prioritized queries. Unless the user chose
+"Skip" in Phase 0 Step 4, dispatch a `research-counter-discovery` agent per
+dimension in MODE: propose alongside it, with RESEARCH_QUESTION added.
 
-  Windows (git-bash):
-  ```
-  ~/.claude/skills/cited-research/.venv/Scripts/python.exe \
-      ~/.claude/skills/cited-research/scripts/multi_search.py \
-      --query "..." --limit 10
-  ```
+*Step 2 — coordinator runs the queries.*
 
-  The skill's `.venv` is populated once via `make install-dev` inside
-  `~/.claude/skills/cited-research/` — see the repo README for install
-  steps. If the venv is missing, the skill still works with degraded
-  coverage (sub-agents' WebSearch results only); report this to the user
-  once per session and proceed.
-- Merge the script's URLs into the URL manifest pool alongside the
-  agents' WebSearch results
-- Deduplicate the combined pool by exact URL before fetching
-- 84.9% of search results are unique to a single engine [§Multi-Engine
-  Search Diversity in `references/research-basis.md`] — this step
-  structurally reduces single-engine bias in the citation pool
-- The coordinator invokes the script, not the sub-agents. This preserves
-  the security boundary where the user sees every outbound action
+First, once per session, probe which backends are alive:
+
+```
+~/.claude/skills/cited-research/.venv/bin/python \
+    ~/.claude/skills/cited-research/scripts/multi_search.py --health
+```
+
+It reports each backend and prints a `suggested --backends` line. Engines
+block intermittently and in clusters — a probe in August 2026 found 3 of 8
+alive — so passing only the live ones avoids spending every query on dead
+backends. If fewer than two are alive it exits non-zero: two independent
+waves cannot be formed, and that is a stop condition (see below).
+
+Then run each query, serially, with the live backend list:
+
+```
+~/.claude/skills/cited-research/.venv/bin/python \
+    ~/.claude/skills/cited-research/scripts/multi_search.py \
+    --query "..." --limit 10 --backends <live list>
+```
+
+Windows (git-bash): swap `.venv/bin/python` for `.venv/Scripts/python.exe`.
+
+Run queries serially, not in parallel. Concurrent hits on the same engines
+are the traffic shape that trips anti-bot challenges, and a challenged
+engine returns a CAPTCHA page instead of results.
+
+The script splits the backends into **two disjoint waves and queries each
+separately**. This is not optional and cannot be disabled. A single combined
+call fills `--limit` from whichever backend answers first — measured, one
+backend alone and all eight together both returned 10 of 10 requested
+results — so one call buys far less diversity than the backend list
+suggests. Two waves force two independent engine populations to contribute.
+
+Write each query's JSON output into the topic's `search/` directory via
+`put_data.py`.
+
+**Read the `coverage` block in the output.** The script returns
+`{"results": [...], "coverage": {...}}`, and coverage carries:
+
+- `single_wave: true` — only one wave answered. Usable, but not two
+  independent samples. Record it in the deliverable's Limitations section.
+- `returned_by_wave` vs `unique_by_wave` — how many results each wave
+  returned against how many survived dedup. A wave can answer successfully
+  and add nothing new. Observed: two healthy waves where the second
+  contributed 0 unique URLs on one query and 2 of 6 on another.
+- `waves_adding_unique` — if this has fewer than two entries, the engines
+  overlapped completely and effective coverage is single-sample despite two
+  waves running. The script warns on stderr; the flag is in the payload so
+  it survives into agent context either way.
+
+Do not report a run as multi-engine when coverage says otherwise.
+
+*Step 2b — encyclopedia sweep (optional, once per dimension).*
+
+```
+... multi_search.py --query "..." --backends wikipedia,grokipedia
+```
+
+Keep these out of the main `--backends` list: both are lookups, not indexes
+(each returns one result), so in a wave they add almost nothing while
+distorting the coverage metrics.
+
+Fetch any hit as normal. `fetch_url.py` detects an encyclopedia URL and
+writes its outbound citation links to a `<name>.refs` sidecar — one URL per
+line, ready to feed straight back into the fetch queue:
+
+```
+while read -r u; do
+    ... fetch_url.py <slug> "fetched/ref-$n.md" "$u"
+done < .tmp-cited-research/<slug>/fetched/<name>.md.refs
+```
+
+Those references are the sources to cite. The article itself is tertiary —
+see `references/citation-format.md` §Tertiary Sources.
+
+*Step 3 — agents triage.* Re-dispatch the same agents in MODE: triage with
+RESULTS_DIR pointing at the JSON. Each returns a URL manifest with tiers,
+verbatim snippet quotes, follow-up queries, and a confidence score.
+Counter-discovery URLs merge into the same pool — no tagging distinguishes
+them. If the user chose "Find and gate" and a counter agent returns
+confidence < 0.3 with no URLs, surface that before iteration 2.
+
+The coordinator then merges all manifests and deduplicates by exact URL
+before fetching.
+
+**When search fails entirely — stop.**
+
+`multi_search.py` exits non-zero when every backend fails. There is no
+WebSearch fallback; that path is banned (Principle 2). A run that cannot
+search cannot discover sources, so:
+
+1. Report which backends failed and the error. A
+   `ProxyError: 403 Forbidden` or `tunnel error` inside a sandbox means the
+   search engines are missing from the network policy — a fixable
+   configuration gap, not an inherent limitation. The repo README lists the
+   hosts to allow.
+2. **Stop and tell the operator.** Do not proceed on a thin pool of
+   whatever URLs happen to be at hand, and do not silently fall back to
+   WebSearch.
+3. `--health` reporting fewer than two live backends is also a stop
+   condition: two independent waves cannot be formed from one engine, so
+   the run cannot deliver the property the methodology depends on.
+4. Partial failure is different: `ddgs` fills `--limit` from whichever
+   backends respond, so some engines being blocked costs cross-engine
+   diversity but not result volume. That degrades; it does not halt —
+   record it in Limitations.
+
+Prerequisite: the skill's `.venv` is populated once via `make install-dev`
+inside `~/.claude/skills/cited-research/`. Without it there is no search at
+all — treat a missing venv the same as total backend failure.
+
+84.9% of search results are unique to a single engine [§Multi-Engine Search
+Diversity in `references/research-basis.md`], which is why the multi-engine
+path is the only sanctioned one rather than a nice-to-have.
 
 **Iteration 2 — Deep read:**
-- Main thread batch-fetches all URLs from all manifests via WebFetch
-- When fetching fails, attempt WebSearch fallbacks before passing results
-  to agents — handle the 20-30% inaccessibility expectation at this layer
+- Main thread batch-fetches all URLs from all manifests using the path
+  established at preflight, writing each page into the topic's `fetched/`
+  directory. See
+  [`references/data-persistence.md`](references/data-persistence.md) for
+  the invocation and exit-code contract
+- When a fetch fails, run a targeted `multi_search.py` query for an
+  alternative source before passing results to agents — handle the 20-30%
+  inaccessibility expectation at this layer.
+  Keep the `FAILED` file either way; do not delete it to tidy the directory
 - Dispatch one `research-analysis` agent per dimension. Provide
   DIMENSION, PROJECT_DESCRIPTION, FETCHED_DIR, and DATA_TYPE in the
   invocation prompt
@@ -307,23 +442,30 @@ See `references/research-basis.md` §Source Triage as Human Gate for evidence.
 ### Providing Fetched Content to Agents
 
 When the main thread fetches URLs for iteration 2+ or for the
-citation audit, persist each page's extracted text under
-`./.tmp-cited-research/<topic-slug>/` via the `put_data.py`
-wrapper, then pass that directory to the agent prompt.
+citation audit, each page's extracted text lands under
+`./.tmp-cited-research/<topic-slug>/fetched/` — written by
+`fetch_url.py` directly, or by `put_data.py` when the run is using
+`WebFetch`. Pass that directory to the agent prompt. Agents read the
+files selectively via the Read tool — never paste page content into
+a prompt.
 
-**Bootstrap first.** Before the first `put_data.py` call for a
-topic, run `bash ~/.claude/skills/cited-research/scripts/bootstrap_tmp.sh
+**Bootstrap first.** Before the first fetch or `put_data.py` call
+for a topic, run
+`bash ~/.claude/skills/cited-research/scripts/bootstrap_tmp.sh
 <topic-slug>`. The bootstrap script provisions the parent
 `./.tmp-cited-research/` and its `.gitignore` of `*`, then wipes
-and recreates the slug subdir. `put_data.py` refuses to create the
-slug root itself — running it without the bootstrap returns a
-fail-fast error pointing at this step. The hard failure exists so
-the parent `.gitignore` protection cannot be silently bypassed,
-which would risk accidentally committing fetched URLs.
+and recreates the slug subdir. Both `fetch_url.py` and
+`put_data.py` refuse to create the slug root themselves — running
+either without the bootstrap returns a fail-fast error pointing at
+this step. The hard failure exists so the parent `.gitignore`
+protection cannot be silently bypassed, which would risk
+accidentally committing fetched URLs.
 
-Read `references/data-persistence.md` for the heredoc pattern,
-the fetched-file header format, and the rationale for routing
-every write through `put_data.py` rather than the Write tool.
+Read `references/data-persistence.md` for the fetch invocation and
+exit codes, the heredoc pattern used by `WebFetch`-mode pages,
+operator-supplied content, and audit reports, the fetched-file header
+format, and the rationale for routing every other write through
+`put_data.py` rather than the Write tool.
 
 ### Convergence Criteria
 
@@ -361,8 +503,11 @@ report the full attribution chain.
 ### Expect Source Failures
 
 Expect **20-30% of sources to be inaccessible** (403 errors, permission denials,
-content mismatches, AI crawler blocking). The main thread handles WebSearch
-fallbacks when URLs fail before passing results to agents. The 2-3 candidate
+content mismatches, AI crawler blocking). The main thread runs targeted
+`multi_search.py` queries for alternatives when URLs fail, before passing
+results to agents. A `FAILED` fetched
+file is a normal outcome, not a run error — the citation-audit agent grades
+those citations `INACCESSIBLE`, which is truthful. The 2-3 candidate
 sources per data point planned in Phase 0 Step 3 provide the redundancy needed
 to absorb this failure rate. Above 50% inaccessibility may indicate the topic
 lacks accessible web sources — adjust the scope.
@@ -496,13 +641,15 @@ tools (see `references/research-basis.md` §Model Assignment by Agent Role).
 ### Pre-Fetch for Citation Audit
 
 Before dispatching the Citation Audit agent, the main thread pre-fetches all
-cited URLs so the audit agent does not need WebFetch:
+cited URLs so the audit agent needs no network access of its own:
 
 1. Read `citations.md` and extract every cited URL
-2. Batch-fetch all URLs via WebFetch (the user approves once per batch)
-3. For URLs that fail, attempt WebSearch fallbacks from the main thread
-4. Persist fetched content to `./.tmp-cited-research/<topic-slug>/` via
-   `put_data.py` (see Phase 1 §Providing Fetched Content for invocation)
+2. Batch-fetch all URLs via the preflight-established path, writing each
+   page into the topic's `fetched/` directory
+3. For URLs that fail, run a targeted `multi_search.py` query from the main
+   thread to find an alternative source
+4. Leave every `FAILED` file in place — the audit agent needs to see which
+   sources were unreachable to grade them `INACCESSIBLE`
 5. Dispatch the `citation-audit` agent with DELIVERABLE_DIR, FETCHED_DIR,
    and SLUG in the invocation prompt — the agent reads files via Read
    tool, does not fetch URLs itself, and persists its report via
@@ -537,8 +684,8 @@ After both sub-agents complete:
 
 1. For INACCURATE or NOT FOUND citations: correct the claim in all files to
    match what the source actually says, or remove the claim and note the gap.
-2. For INACCESSIBLE sources: the main thread attempts alternative WebSearch
-   queries and re-fetches. If unsuccessful, downgrade the claim to "unverified"
+2. For INACCESSIBLE sources: the main thread runs alternative
+   `multi_search.py` queries and re-fetches. If unsuccessful, downgrade the claim to "unverified"
    with a note.
 3. For FAIL consistency checks: reconcile across all files — fix every file
    that references the incorrect value.
@@ -579,6 +726,36 @@ The non-negotiable elements at every scale:
 2. URLs are recorded
 3. Writing and verification are separate steps
 4. The writer knows verification will happen
+
+### Post-Run Report
+
+After the audits are promoted, print the run report:
+
+```
+~/.claude/skills/cited-research/.venv/bin/python \
+    ~/.claude/skills/cited-research/scripts/run_report.py <topic-slug>
+```
+
+It counts agent losses, engines used, fetch outcomes, citation tiers, and
+verified-vs-not from the artifacts on disk.
+
+**Paste the report into your reply, inside a fenced code block, in full.**
+Running the command is not showing it. Command output goes to the model, not
+reliably to the user — a user reading the conversation sees nothing unless
+the text is in the response body. Copy every line, including the sections
+that report missing inputs; a section reading "no agents.tsv" is a finding,
+not filler to trim.
+
+Do not summarise it, restate its numbers in prose, or recompute any of them
+yourself. The script exists so the same run always reports the same figures,
+and so the reported figures are not the model's recollection of the run.
+
+Anything it flags with `!` is a finding to address or disclose:
+
+- agent signal loss above zero
+- queries that returned a single wave
+- citations defined but never cited
+- citations never audited
 
 ## Phase 5: Index Maintenance (cited-research repo only)
 

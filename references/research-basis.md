@@ -297,7 +297,7 @@ Run the updated skill end-to-end on a topic that invites counter-perspective
 (e.g., "should we use microservices?"). Observe:
 
 - **Multi-engine search (Phase 1):** URL pool includes results from both
-  WebSearch and DuckDuckGo. Dedup removes exact-URL duplicates.
+  the engines `ddgs` fronts. Dedup removes exact-URL duplicates.
 - **Counter-perspective (Phase 2):** Citation pool includes sources that
   push back on the premise. Writer surfaces dissenting views as part of
   normal synthesis, not in a separate "counter" section.
@@ -418,7 +418,7 @@ mitigation strategies effective for expert anchoring.
 
 ## Multi-Engine Search Diversity
 
-The skill augments WebSearch with additional search engines (starting with
+The skill searches through multiple engines (starting with
 DuckDuckGo) to reduce single-engine bias in the citation pool. The
 coordinator runs `scripts/multi-search.py` between discovery and deep-read
 iterations, merges results, and deduplicates by URL before fetching.
@@ -432,7 +432,8 @@ a structural bias that limits what sources the research can discover.
 **Design choice — coordinator-invoked:** The coordinator runs the
 multi-search script rather than sub-agents. This preserves the existing
 security boundary where the user sees every outbound action from the main
-thread. Sub-agents continue to use WebSearch for their own discovery; the
+thread. Sub-agents no longer search at all — they propose queries and
+triage the results the coordinator returns; the
 script's results are merged at the coordinator level.
 
 ### Citations
