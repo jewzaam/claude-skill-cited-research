@@ -19,10 +19,24 @@ The split is not optional and has no disabling flag. Coverage is reported in
 the output payload, not only on stderr, so a caller cannot overlook a run
 that silently collapsed to one wave.
 
+Engines. `ddg` fronts the ddgs scrapers and is the default. `scholarly`
+queries OpenAlex, Crossref and Wikipedia full-text as JSON APIs through the
+host-side fetch service: no key, no anti-bot layer, so it answers when every
+scraper is blocked. It indexes papers and encyclopedia articles rather than
+the open web, so it widens a pool — it does not replace one.
+
+Every wave and every health probe retries with jittered backoff. ddgs
+reports a blocked engine and a genuine zero-hit query identically, and the
+live backend set flaps between probes minutes apart, so a share of failures
+are transient and worth one more request.
+
 Usage (from the skill install directory, via its own venv):
     ~/.claude/skills/cited-research/.venv/bin/python \\
         ~/.claude/skills/cited-research/scripts/multi_search.py \\
         --query "..." --limit 10
+
+    # add the keyless scholarly APIs alongside the scrapers
+    ... multi_search.py --query "..." --engines ddg,scholarly
 
     # probe which backends are alive, one request each
     ... multi_search.py --health
@@ -39,15 +53,61 @@ Output:
 
 import argparse
 import json
+import random
+import re
 import sys
+import time
+import urllib.parse
 
-SUPPORTED_ENGINES = {"ddg"}
+SUPPORTED_ENGINES = {"ddg", "scholarly"}
 
 # Engines excluded from the default set. They are real text backends, but
 # an encyclopedia is not a comparable source to a web index for most
 # research questions — keep them available via --backends, out of the
 # default.
 NON_WEB_BACKENDS = frozenset({"wikipedia", "grokipedia"})
+
+# Every ddgs backend is a scraper that gets through only because `primp`
+# impersonates a browser's TLS fingerprint, so anti-bot defenses knock
+# engines out and let them back in on their own schedule — four identical
+# `--health` probes in one session returned 3/7, 1/7, 2/7 and 2/7 alive.
+# A retry costs one request and recovers the transient share of that.
+RETRY_ATTEMPTS = 3
+RETRY_BASE_SECONDS = 2.0
+
+
+def _sleep_backoff(attempt: int) -> None:
+    """Exponential backoff with jitter.
+
+    Jitter matters more than the exponent here: waves and health probes fire
+    in a tight loop against the same engines, and synchronized retries are
+    the traffic shape that gets an IP challenged in the first place.
+    """
+    time.sleep(RETRY_BASE_SECONDS * (2**attempt) + random.uniform(0, 1))
+
+
+def with_retry(call, describe: str, attempts: int = RETRY_ATTEMPTS):
+    """Call `call` until it returns something truthy, then return it.
+
+    An empty result is retried, not just an exception: ddgs reports a
+    blocked engine as `DDGSException: No results found`, which is
+    indistinguishable from a genuine zero-hit query at this layer. Retrying
+    both is cheap and the zero-hit case simply fails three times instead of
+    one. Raises RuntimeError carrying the last failure when every attempt
+    is exhausted.
+    """
+    last: object = "no results"
+    for attempt in range(attempts):
+        try:
+            out = call()
+            if out:
+                return out
+            last = "no results"
+        except Exception as e:  # noqa: BLE001 — the caller decides what a failure means
+            last = e
+        if attempt < attempts - 1:
+            _sleep_backoff(attempt)
+    raise RuntimeError(f"{describe} failed after {attempts} attempts: {last}")
 
 
 def text_backends() -> list[str]:
@@ -103,8 +163,12 @@ def _query_wave(query: str, limit: int, wave_backends: list[str], label: str) ->
     from ddgs import DDGS
 
     joined = ",".join(wave_backends)
-    with DDGS() as ddgs:
-        hits = ddgs.text(query, max_results=limit, backend=joined)
+
+    def _once():
+        with DDGS() as ddgs:
+            return ddgs.text(query, max_results=limit, backend=joined)
+
+    hits = with_retry(_once, f"wave {label} ({joined})")
     return [
         {
             "url": r.get("href", ""),
@@ -121,31 +185,28 @@ def _query_wave(query: str, limit: int, wave_backends: list[str], label: str) ->
     ]
 
 
-def search_ddg(query: str, limit: int, backends: str = "") -> dict:
-    """Search both waves and return {"results": [...], "coverage": {...}}."""
-    try:
-        import ddgs  # noqa: F401
-    except ImportError:
-        print(
-            "Error: ddgs not installed. Run: python -m pip install ddgs",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+def collect_waves(
+    wave_a: list[str], wave_b: list[str], run_one, prefix: str = ""
+) -> dict:
+    """Run two waves through `run_one` and build the coverage payload.
 
-    backends = backends or ",".join(default_backends())
-    wave_a, wave_b = split_waves(backends)
-    waves = [("A", wave_a), ("B", wave_b)]
+    `run_one(members, label)` returns normalized records or raises. Shared by
+    every engine so that one engine's coverage means the same thing as
+    another's — the wave vocabulary is what the run report and the
+    deliverable's Limitations section are written against.
+    """
     results: list[dict] = []
     ok: list[str] = []
     failed: list[dict] = []
     returned_by_wave: dict[str, int] = {}
 
-    for label, members in waves:
+    for short, members in (("A", wave_a), ("B", wave_b)):
+        label = f"{prefix}{short}"
         if not members:
             failed.append({"wave": label, "backends": "", "error": "no backends"})
             continue
         try:
-            hits = _query_wave(query, limit, members, label)
+            hits = run_one(members, label)
         except Exception as e:  # noqa: BLE001 — any engine error degrades one wave
             failed.append(
                 {"wave": label, "backends": ",".join(members), "error": str(e)[:200]}
@@ -183,6 +244,213 @@ def search_ddg(query: str, limit: int, backends: str = "") -> dict:
     return {"results": results, "coverage": coverage}
 
 
+def search_ddg(query: str, limit: int, backends: str = "") -> dict:
+    """Search both waves and return {"results": [...], "coverage": {...}}."""
+    try:
+        import ddgs  # noqa: F401
+    except ImportError:
+        print(
+            "Error: ddgs not installed. Run: python -m pip install ddgs",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    wave_a, wave_b = split_waves(backends or ",".join(default_backends()))
+    return collect_waves(
+        wave_a,
+        wave_b,
+        lambda members, label: _query_wave(query, limit, members, label),
+    )
+
+
+# Scholarly and institutional indexes, reached through the host-side fetch
+# service. Unlike every ddgs backend these are documented JSON APIs with no
+# anti-bot layer and no key, so they answer on days when the scrapers are
+# blocked — which is the reason this engine exists.
+#
+# They are not a web index and must not be sold as one: they cover papers,
+# registered DOIs and encyclopedia articles. Good for treaty text, statistics
+# and peer-reviewed analysis; useless for a government fee schedule.
+SCHOLARLY_SOURCES = ("openalex", "crossref", "wikipedia-fulltext")
+
+_SCHOLARLY_URLS = {
+    "openalex": "https://api.openalex.org/works?search={q}&per-page={n}",
+    "crossref": "https://api.crossref.org/works?query={q}&rows={n}",
+    "wikipedia-fulltext": (
+        "https://en.wikipedia.org/w/api.php?action=query&list=search"
+        "&srsearch={q}&format=json&srlimit={n}"
+    ),
+}
+
+_TAG = re.compile(r"<[^>]+>")
+
+
+def _strip_tags(text: str) -> str:
+    """Drop markup from a snippet, leaving the source's own wording."""
+    return " ".join(_TAG.sub(" ", text or "").split())
+
+
+def openalex_abstract(inverted: object) -> str:
+    """Rebuild an abstract from OpenAlex's inverted index.
+
+    OpenAlex ships abstracts as {word: [positions]} rather than prose, for
+    licensing reasons. Reconstructing returns the publisher's own abstract
+    text, which is what the snippet field has to carry: agents are instructed
+    to quote snippets verbatim, so a summary written here would be quoted
+    back as if it were source wording.
+    """
+    if not isinstance(inverted, dict):
+        return ""
+    slots: dict[int, str] = {}
+    for word, positions in inverted.items():
+        if isinstance(positions, list):
+            for p in positions:
+                if isinstance(p, int):
+                    slots[p] = word
+    return " ".join(slots[i] for i in sorted(slots))
+
+
+def parse_openalex(payload: dict) -> list[dict]:
+    out = []
+    for work in payload.get("results") or []:
+        location = work.get("primary_location") or {}
+        url = work.get("doi") or location.get("landing_page_url") or work.get("id")
+        if not url:
+            continue
+        out.append(
+            {
+                "url": url,
+                "title": work.get("display_name") or work.get("title") or "",
+                "snippet": openalex_abstract(work.get("abstract_inverted_index")),
+            }
+        )
+    return out
+
+
+def parse_crossref(payload: dict) -> list[dict]:
+    out = []
+    for item in (payload.get("message") or {}).get("items") or []:
+        url = item.get("URL")
+        if not url:
+            continue
+        title = item.get("title") or []
+        out.append(
+            {
+                "url": url,
+                "title": title[0] if isinstance(title, list) and title else "",
+                # Crossref abstracts are JATS XML when present at all.
+                "snippet": _strip_tags(item.get("abstract") or ""),
+            }
+        )
+    return out
+
+
+def parse_wikipedia_fulltext(payload: dict) -> list[dict]:
+    out = []
+    for hit in ((payload.get("query") or {}).get("search")) or []:
+        title = hit.get("title") or ""
+        if not title:
+            continue
+        slug = urllib.parse.quote(title.replace(" ", "_"), safe="")
+        out.append(
+            {
+                "url": f"https://en.wikipedia.org/wiki/{slug}",
+                "title": title,
+                # The API marks matched terms with <span class="searchmatch">.
+                "snippet": _strip_tags(hit.get("snippet") or ""),
+            }
+        )
+    return out
+
+
+_SCHOLARLY_PARSERS = {
+    "openalex": parse_openalex,
+    "crossref": parse_crossref,
+    "wikipedia-fulltext": parse_wikipedia_fulltext,
+}
+
+
+def _fetch_json(url: str) -> dict:
+    """GET `url` through the fetch service and parse the body as JSON."""
+    from scripts.fetch_url import fetch
+
+    try:
+        status, _ctype, body = fetch(url)
+    except SystemExit as e:
+        # fetch_url exits 3 when the service or the network policy is the
+        # problem. Converting it to an exception keeps a ddg wave that
+        # already succeeded from being thrown away with it; fetch_url has
+        # already explained the cause on stderr.
+        raise RuntimeError(f"fetch service unavailable (exit {e.code})") from e
+    if status != "OK":
+        raise RuntimeError(status)
+    return json.loads(body)
+
+
+def _scholarly_wave(query: str, limit: int, sources: list[str], label: str) -> list:
+    """Query every source in one wave, keeping whatever answers."""
+    encoded = urllib.parse.quote(query, safe="")
+    records: list[dict] = []
+    for name in sources:
+        url = _SCHOLARLY_URLS[name].format(q=encoded, n=limit)
+        try:
+            payload = with_retry(lambda u=url: _fetch_json(u), name, attempts=2)
+        except Exception as e:  # noqa: BLE001 — one dead source is not a dead wave
+            print(f"Warning: {name} failed: {e}", file=sys.stderr)
+            continue
+        for record in _SCHOLARLY_PARSERS[name](payload):
+            record.update({"wave": label, "backends": name})
+            records.append(record)
+    return records
+
+
+def search_scholarly(query: str, limit: int) -> dict:
+    """Search the scholarly APIs in two waves, same contract as search_ddg."""
+    wave_a, wave_b = split_waves(",".join(SCHOLARLY_SOURCES))
+    return collect_waves(
+        wave_a,
+        wave_b,
+        lambda members, label: _scholarly_wave(query, limit, members, label),
+        prefix="scholarly:",
+    )
+
+
+def merge_coverage(per_engine: dict[str, dict]) -> dict:
+    """Combine per-engine coverage into one payload.
+
+    A single engine keeps its coverage block unchanged — that is the common
+    case and the shape the run report and every existing search JSON file
+    were written against. With more than one engine the flat fields become
+    the aggregate, and `engines` carries each engine's own block so a reader
+    can still see which one contributed what.
+    """
+    if len(per_engine) == 1:
+        return next(iter(per_engine.values()))
+    ok: list[str] = []
+    failed: list[dict] = []
+    a_parts: list[str] = []
+    b_parts: list[str] = []
+    returned: dict[str, int] = {}
+    for cov in per_engine.values():
+        ok.extend(cov.get("waves_ok") or [])
+        failed.extend(cov.get("waves_failed") or [])
+        if cov.get("wave_a_backends"):
+            a_parts.append(cov["wave_a_backends"])
+        if cov.get("wave_b_backends"):
+            b_parts.append(cov["wave_b_backends"])
+        returned.update(cov.get("returned_by_wave") or {})
+    return {
+        "engines": per_engine,
+        "waves_ok": ok,
+        "waves_failed": failed,
+        "wave_a_backends": ",".join(a_parts),
+        "wave_b_backends": ",".join(b_parts),
+        "independent_samples": len(ok),
+        "single_wave": len(ok) == 1,
+        "returned_by_wave": returned,
+    }
+
+
 def wave_contribution(results: list[dict]) -> dict:
     """Count how many *unique* URLs each wave contributed after dedup.
 
@@ -201,6 +469,7 @@ def wave_contribution(results: list[dict]) -> dict:
 
 ENGINE_FUNCTIONS = {
     "ddg": search_ddg,
+    "scholarly": search_scholarly,
 }
 
 
@@ -238,12 +507,19 @@ def run_health(limit: int = 3) -> int:
     query = "test query"
 
     def _urls(backend: str) -> list[str] | None:
-        try:
+        def _once():
             with DDGS() as ddgs:
-                hits = ddgs.text(query, max_results=limit, backend=backend)
+                return ddgs.text(query, max_results=limit, backend=backend)
+
+        try:
+            # Two attempts, not the full three: the probe runs against every
+            # backend serially, so each extra attempt is paid seven times
+            # over. One retry separates a hard block from a flap; a second
+            # mostly buys wall-clock.
+            hits = with_retry(_once, backend, attempts=2)
             return [h.get("href", "") for h in hits]
         except Exception as e:  # noqa: BLE001
-            print(f"{backend:12} FAIL  {type(e).__name__}: {str(e)[:70]}")
+            print(f"{backend:12} FAIL  {str(e)[:80]}")
             return None
 
     sentinel = _urls("zz-unregistered-sentinel")
@@ -257,10 +533,11 @@ def run_health(limit: int = 3) -> int:
     alive, shadowed = [], []
     for backend in backends:
         urls = _urls(backend)
-        if urls is None:
-            continue
+        # No empty branch: with_retry treats an empty result as a failure and
+        # raises, so `_urls` returns either results or None. The distinction
+        # survives in the printed reason — "no results" for an engine that
+        # answered with nothing, the exception text for one that threw.
         if not urls:
-            print(f"{backend:12} EMPTY")
             continue
         if sentinel_set and set(urls) == sentinel_set:
             shadowed.append(backend)
@@ -297,7 +574,11 @@ def main():
     parser.add_argument(
         "--engines",
         default="ddg",
-        help="Comma-separated engine list (default: ddg)",
+        help="Comma-separated engine list (default: ddg). `scholarly` adds "
+        "OpenAlex, Crossref and Wikipedia full-text via the fetch service — "
+        "keyless and not anti-bot defended, so it still answers when the "
+        "ddgs scrapers are blocked. Opt-in: it indexes papers, not the open "
+        "web.",
     )
     parser.add_argument(
         "--limit",
@@ -350,20 +631,21 @@ def main():
             sys.exit(1)
 
     all_results: list[dict] = []
-    coverage: dict = {}
+    per_engine: dict[str, dict] = {}
     failures = 0
     for engine in engines:
         try:
-            # `backends` is ddgs-specific — a future engine with its own API
-            # would not take it, so it is passed only to the engine that
+            # `backends` is ddgs-specific — another engine with its own API
+            # does not take it, so it is passed only to the engine that
             # understands it rather than forced into the shared signature.
             extra = {"backends": args.backends} if engine == "ddg" else {}
             payload = ENGINE_FUNCTIONS[engine](args.query, args.limit, **extra)
             all_results.extend(payload["results"])
-            coverage = payload["coverage"]
+            per_engine[engine] = payload["coverage"]
         except Exception as e:  # noqa: BLE001
             failures += 1
             print(f"Warning: {engine} search failed: {e}", file=sys.stderr)
+    coverage = merge_coverage(per_engine) if per_engine else {}
 
     deduped = deduplicate(all_results)
     if coverage:

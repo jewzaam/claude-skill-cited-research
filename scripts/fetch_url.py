@@ -18,6 +18,7 @@ fetch and the fetched-file header format stays consistent.
 
 Usage:
     python fetch_url.py <slug> <relative-path> <url>
+    python fetch_url.py --batch <slug>      # URLs on stdin, one per line
     python fetch_url.py --check
 
 Encyclopedia handling: when the URL is a Wikipedia or Grokipedia article,
@@ -39,7 +40,10 @@ Exit codes:
 """
 
 import argparse
+import hashlib
+import io
 import os
+import re
 import sys
 import urllib.error
 import urllib.parse
@@ -50,6 +54,21 @@ from html.parser import HTMLParser
 from scripts._data_paths import atomic_write, require_slug_root, safe_target
 
 DEFAULT_SERVICE = "http://172.30.0.21:8090"
+
+# Pages of a PDF to extract. A 900-page gazette would otherwise blow up an
+# agent's context while presenting itself as a complete source.
+MAX_PDF_PAGES = 400
+
+# OCR runs about 4 s per page on CPU, so the cap is two orders of magnitude
+# tighter than the text-layer one. 20 pages is roughly 90 s — tolerable inside
+# a batch; 400 would be half an hour for one document.
+MAX_OCR_PAGES = 20
+
+# Below this, an `OK` HTML fetch is treated as a failure. A JS-rendered page
+# returns its shell — nav, footer, a loading div — and nothing else. Recording
+# that as a success is worse than a clean failure: it grades as a fetched
+# source and supports no claim made on the page.
+MIN_HTML_CHARS = 200
 
 # The service caps responses at 8 MB and upstream reads at 30 s. Allow
 # headroom past its own timeout so a slow upstream surfaces as the service's
@@ -239,8 +258,172 @@ def html_to_text(html: str) -> str:
     return parser.text()
 
 
+def pdf_to_text(raw: bytes) -> tuple[str, str]:
+    """Extract a PDF's text layer. Returns (status, text).
+
+    PDFs are not an edge case here: legislation, official gazettes, court
+    statistics and intergovernmental reports publish as PDF far more often
+    than the commentary that restates them in HTML. Refusing them fails the
+    Tier 1 half of a source pool while the Tier 3 restatements succeed.
+
+    A scanned PDF has pages but no text layer, and is reported as its own
+    failure rather than as an empty body — an empty body reads to an audit
+    agent as "the source said nothing", which is a different and wrong claim.
+    """
+    try:
+        from pypdf import PdfReader
+    except ImportError:
+        return "FAILED (pypdf not installed — pip install -e .)", ""
+    try:
+        reader = PdfReader(io.BytesIO(raw))
+        pages = reader.pages[:MAX_PDF_PAGES]
+        text = "\n\n".join(p.extract_text() or "" for p in pages)
+    except Exception as e:  # noqa: BLE001 — a malformed PDF is a page failure
+        return f"FAILED (pdf parse error: {_one_line(str(e), 100)})", ""
+    if not text.strip():
+        return ocr_pdf(raw)
+    total = len(reader.pages)
+    note = (
+        f" [truncated at {MAX_PDF_PAGES} of {total} pages]"
+        if total > MAX_PDF_PAGES
+        else ""
+    )
+    return f"OK{note}", text
+
+
+def ocr_pdf(raw: bytes) -> tuple[str, str]:
+    """Read a scanned PDF by rendering its pages and running OCR.
+
+    A scanned statute is a total loss otherwise, and recognising characters
+    is mechanical — no judgement, no model prompt, same bytes in same text
+    out. Worth doing. Two things make it a gated fallback rather than the
+    default path:
+
+    **The output is a transcription, not the source.** OCR misreads produce
+    text that looks exactly like verbatim quotation, and a misread digit in a
+    tax rate is a plausible wrong number. The citation-audit agent compares
+    the deliverable against this file, so a corrupted digit here would be
+    confirmed, not caught — the audit and the error share a cause. The status
+    line therefore says OCR, and callers must treat the body as evidence that
+    a claim is supported, never as a quotable string.
+
+    **It is slow.** Roughly 4 s per page on CPU, so the page cap is far below
+    the text-layer one; a long scanned gazette is deliberately truncated
+    rather than allowed to stall a batch for half an hour.
+
+    Requires the optional extra (`pip install -e ".[ocr]"`). Absent, this
+    reports the scanned-PDF failure and names the install.
+    """
+    try:
+        import numpy as np
+        import pypdfium2 as pdfium
+        from rapidocr_onnxruntime import RapidOCR
+    except ImportError:
+        return (
+            "FAILED (no text layer — likely a scanned image PDF; "
+            'OCR fallback unavailable, pip install -e ".[ocr]")'
+        ), ""
+    try:
+        doc = pdfium.PdfDocument(raw)
+        total = len(doc)
+        engine = RapidOCR()
+        chunks = []
+        for page in list(doc)[:MAX_OCR_PAGES]:
+            # scale=2 is ~150 dpi. Below that, recall on body text drops
+            # sharply; above it, runtime grows faster than accuracy.
+            image = np.array(page.render(scale=2).to_pil())
+            result, _ = engine(image)
+            chunks.append("\n".join(line[1] for line in (result or [])))
+        text = "\n\n".join(chunks)
+    except Exception as e:  # noqa: BLE001 — a failed render is a page failure
+        return f"FAILED (ocr error: {_one_line(str(e), 100)})", ""
+    if not text.strip():
+        return "FAILED (no text layer, and OCR found no characters)", ""
+    note = (
+        f", truncated at {MAX_OCR_PAGES} of {total} pages"
+        if total > MAX_OCR_PAGES
+        else ""
+    )
+    return f"OK (OCR — transcription, not verbatim source{note})", text
+
+
+def ascii_url(url: str) -> str:
+    """Rewrite a URL into the all-ASCII form the wire actually carries.
+
+    A URL holding a literal non-ASCII character — `notaires.fr/…/départements`,
+    most of INE Portugal — reaches the fetch service intact, and the service's
+    HTTP client then dies on it with `'ascii' codec can't encode character`,
+    surfacing here as an unexplained 502. Percent-encoding the path and
+    IDNA-encoding the host before the request removes the character the
+    service cannot handle. Already-encoded sequences pass through untouched,
+    so this is a no-op for the ordinary case.
+    """
+    parts = urllib.parse.urlsplit(url)
+    netloc = parts.netloc
+    if any(ord(c) > 127 for c in netloc):
+        userinfo, at, hostport = netloc.rpartition("@")
+        hostname, colon, port = hostport.partition(":")
+        try:
+            hostname = hostname.encode("idna").decode("ascii")
+        except (UnicodeError, ValueError):
+            hostname = urllib.parse.quote(hostname, safe="")
+        netloc = f"{userinfo}{at}{hostname}{colon}{port}"
+    return urllib.parse.urlunsplit(
+        (
+            parts.scheme,
+            netloc,
+            urllib.parse.quote(parts.path, safe="/%"),
+            urllib.parse.quote(parts.query, safe="=&%+"),
+            urllib.parse.quote(parts.fragment, safe="%"),
+        )
+    )
+
+
+def url_to_name(url: str) -> str:
+    """Stable, filesystem-safe filename for a URL.
+
+    The hash suffix is not decoration: two URLs sharing a long prefix — the
+    same gazette with different document ids — would otherwise truncate to
+    the same name and one would silently overwrite the other.
+    """
+    stem = re.sub(r"[^A-Za-z0-9._-]", "-", re.sub(r"^https?://", "", url))[:80]
+    digest = hashlib.sha1(url.encode()).hexdigest()[:8]
+    return f"{stem}-{digest}.md"
+
+
 def _service_base() -> str:
     return os.environ.get("CITED_RESEARCH_FETCH_SERVICE", DEFAULT_SERVICE).rstrip("/")
+
+
+# What each capability needs, and what is lost without it. Checked at
+# preflight rather than discovered mid-run: a missing extractor surfaces
+# eighty URLs in as a wall of `FAILED`, by which point the run has spent an
+# hour and the operator is debugging the wrong thing.
+CAPABILITIES = (
+    # (import name, install extra, required, what breaks without it)
+    ("pypdf", "", True, "PDF sources — legislation, gazettes, statistics"),
+    ("pypdfium2", "ocr", False, "OCR fallback for scanned PDFs"),
+    ("rapidocr_onnxruntime", "ocr", False, "OCR fallback for scanned PDFs"),
+)
+
+
+def check_dependencies() -> tuple[list[str], bool]:
+    """Report each capability's availability. Returns (lines, ok)."""
+    import importlib.util
+
+    lines, ok = [], True
+    for module, extra, required, loses in CAPABILITIES:
+        present = importlib.util.find_spec(module) is not None
+        if present:
+            lines.append(f"  OK       {module}")
+        elif required:
+            ok = False
+            lines.append(f"  MISSING  {module} — loses {loses}; pip install -e .")
+        else:
+            lines.append(
+                f'  absent   {module} — no {loses}; pip install -e ".[{extra}]"'
+            )
+    return lines, ok
 
 
 def check_service() -> int:
@@ -302,21 +485,22 @@ def _classify_denial(status: int, body: str, base: str) -> str:
     return f"fetch service returned HTTP {status}: {_one_line(body, 200)}"
 
 
-def fetch(url: str) -> tuple[str, str, str]:
+def fetch(url: str) -> tuple[str, str, bytes]:
     """Fetch `url` via the service.
 
-    Returns (status_line, content_type, body) where status_line is the value
-    for the file's `# Status:` header. Raises SystemExit(3) when the service
-    or the policy — rather than the upstream page — is the problem.
+    Returns (status_line, content_type, raw_body) where status_line is the
+    value for the file's `# Status:` header. The body stays bytes because
+    PDFs are a first-class source type here and decoding early would destroy
+    them. Raises SystemExit(3) when the service or the policy — rather than
+    the upstream page — is the problem.
     """
     base = _service_base()
-    encoded = urllib.parse.quote(url, safe="")
+    encoded = urllib.parse.quote(ascii_url(url), safe="")
     request_url = f"{base}/fetch?url={encoded}"
     try:
         with urllib.request.urlopen(request_url, timeout=TIMEOUT_SECONDS) as resp:
-            raw = resp.read()
             ctype = resp.headers.get("Content-Type", "")
-            return "OK", ctype, raw.decode("utf-8", errors="replace")
+            return "OK", ctype, resp.read()
     except urllib.error.HTTPError as e:
         body = _read_error_body(e)
         stripped = body.lstrip()
@@ -333,22 +517,42 @@ def fetch(url: str) -> tuple[str, str, str]:
         # Collapse whitespace before truncating: error bodies are often full
         # HTML error pages, and an embedded newline would split the single-line
         # `# Status:` header and spill markup into the header block.
-        return f"FAILED ({e.code}: {_one_line(stripped)})", "", ""
+        return f"FAILED ({e.code}: {_one_line(stripped)})", "", b""
     except (urllib.error.URLError, OSError) as e:
         print(OFFLINE_MESSAGE.format(addr=base), file=sys.stderr)
         print(f"({e})", file=sys.stderr)
         raise SystemExit(3)
 
 
-def render(url: str, status: str, ctype: str, body: str) -> str:
+def is_pdf(ctype: str, raw: bytes) -> bool:
+    """PDF by declared type, or by magic bytes when a host mislabels it.
+
+    `application/octet-stream` on a `.pdf` URL is common enough that going by
+    the header alone loses real sources.
+    """
+    return "pdf" in ctype.lower() or raw[:5] == b"%PDF-"
+
+
+def render(url: str, status: str, ctype: str, raw: bytes) -> str:
     """Build the fetched-file content, header included."""
     lowered = ctype.lower()
-    if status == "OK":
+    body = ""
+    if status != "OK":
+        pass
+    elif is_pdf(lowered, raw):
+        status, body = pdf_to_text(raw)
+    elif lowered and not lowered.startswith(("text/", "application/json")):
+        status = f"FAILED (binary content-type {ctype}, not extractable as text)"
+    else:
+        body = raw.decode("utf-8", errors="replace")
         if "html" in lowered:
             body = html_to_text(body)
-        elif lowered and not lowered.startswith(("text/", "application/json")):
-            status = f"FAILED (binary content-type {ctype}, not extractable as text)"
-            body = ""
+            if len(body.strip()) < MIN_HTML_CHARS:
+                status = (
+                    f"FAILED (empty after extraction, {len(body.strip())} chars — "
+                    "likely a JS-rendered page or a challenge interstitial)"
+                )
+                body = ""
     stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     # `# Status:` must stay one line — agents and the audit step read the
     # header as a fixed three-line block.
@@ -360,39 +564,85 @@ def render(url: str, status: str, ctype: str, body: str) -> str:
     )
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Fetch a URL via the host-side fetch service and persist it."
-    )
-    parser.add_argument("--check", action="store_true", help="probe /healthz and exit")
-    parser.add_argument("slug", nargs="?", help="topic slug")
-    parser.add_argument("rel", nargs="?", help="relative path within the slug dir")
-    parser.add_argument("url", nargs="?", help="URL to fetch")
-    args = parser.parse_args()
-
-    if args.check:
-        sys.exit(check_service())
-    if not (args.slug and args.rel and args.url):
-        parser.error("slug, relative-path, and url are required unless --check")
-
-    target = safe_target(args.slug, args.rel)
-    require_slug_root(args.slug)
-    status, ctype, body = fetch(args.url)
-    atomic_write(target, render(args.url, status, ctype, body))
+def fetch_one(slug: str, rel: str, url: str) -> str:
+    """Fetch one URL and persist it. Returns the line to print."""
+    target = safe_target(slug, rel)
+    status, ctype, raw = fetch(url)
+    content = render(url, status, ctype, raw)
+    atomic_write(target, content)
+    # `render` can downgrade OK to FAILED; report what was written, not what
+    # the service said.
+    status = content.split("# Status: ", 1)[1].split("\n", 1)[0]
 
     # Encyclopedia articles are mined, not cited. Harvesting their reference
     # lists is deterministic parsing, so it happens here rather than being
     # asked of a model: the sidecar is a plain URL-per-line file the caller
     # feeds straight back into the fetch queue.
     refs_note = ""
-    if status == "OK" and "html" in ctype.lower() and is_encyclopedia(args.url):
-        refs = extract_reference_urls(body, args.url)
+    if status.startswith("OK") and "html" in ctype.lower() and is_encyclopedia(url):
+        refs = extract_reference_urls(raw.decode("utf-8", errors="replace"), url)
         if refs:
-            refs_target = safe_target(args.slug, args.rel + ".refs")
+            refs_target = safe_target(slug, rel + ".refs")
             atomic_write(refs_target, "\n".join(refs) + "\n")
             refs_note = f"\t{len(refs)} refs -> {refs_target}"
+    return f"{status}\t{target}{refs_note}"
 
-    print(f"{status}\t{target}{refs_note}")
+
+def run_batch(slug: str, lines: list[str]) -> None:
+    """Fetch every URL on stdin into `fetched/`, naming files from the URL.
+
+    Exists because the alternative is a hand-rolled shell loop per run, and
+    the loop is where filename collisions and swallowed failures get
+    reinvented. Failures are counted, not fatal: a 20-30% inaccessibility
+    rate is the expected case.
+    """
+    ok = failed = 0
+    for line in lines:
+        url = line.strip()
+        if not url or url.startswith("#"):
+            continue
+        # A SystemExit from `fetch` means the service or the policy is down,
+        # not that this URL is bad. Let it abort the queue.
+        out = fetch_one(slug, f"fetched/{url_to_name(url)}", url)
+        if out.startswith("OK"):
+            ok += 1
+        else:
+            failed += 1
+        print(out, flush=True)
+    print(f"batch complete: ok={ok} failed={failed}", file=sys.stderr)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Fetch a URL via the host-side fetch service and persist it."
+    )
+    parser.add_argument("--check", action="store_true", help="probe /healthz and exit")
+    parser.add_argument(
+        "--batch",
+        action="store_true",
+        help="read URLs from stdin, one per line, into <slug>/fetched/",
+    )
+    parser.add_argument("slug", nargs="?", help="topic slug")
+    parser.add_argument("rel", nargs="?", help="relative path within the slug dir")
+    parser.add_argument("url", nargs="?", help="URL to fetch")
+    args = parser.parse_args()
+
+    if args.check:
+        code = check_service()
+        lines, deps_ok = check_dependencies()
+        print("\n".join(lines), file=sys.stderr if code else sys.stdout)
+        sys.exit(code or (0 if deps_ok else 3))
+    if args.batch:
+        if not args.slug:
+            parser.error("slug is required with --batch")
+        require_slug_root(args.slug)
+        run_batch(args.slug, sys.stdin.readlines())
+        return
+    if not (args.slug and args.rel and args.url):
+        parser.error("slug, relative-path, and url are required unless --check")
+
+    require_slug_root(args.slug)
+    print(fetch_one(args.slug, args.rel, args.url))
 
 
 if __name__ == "__main__":

@@ -30,12 +30,31 @@ own file, and doing both produces a duplicate with a mangled header.
 Windows (git-bash): swap `.venv/bin/python` for
 `.venv/Scripts/python.exe`. It prints `<status>\t<path>`.
 
+For more than a couple of URLs use `--batch`, which reads them from stdin
+one per line, derives each filename from the URL, and writes into
+`fetched/`:
+
+```
+... fetch_url.py --batch <topic-slug> < urls.txt
+```
+
+Blank lines and `#` comments are skipped. Each URL prints its own
+`<status>\t<path>` line; a `batch complete: ok=N failed=N` summary goes to
+stderr. A page failure is counted and the queue continues; a service or
+policy failure aborts it, because every remaining URL would fail the same
+way. Prefer this over a hand-rolled shell loop — the loop is where
+filename collisions and swallowed failures get reinvented.
+
 The script calls the host-side fetch service, whose behavior — request
 format, response envelope, limits, and what to do when it is offline — is
 documented at
 <https://github.com/jewzaam/openshell-sandbox/blob/main/docs/fetch-service.md>.
-`--check` probes the service and is the preflight in
-`SKILL.md §Phase 1`.
+`--check` is the preflight in `SKILL.md §Phase 1`. It probes the service
+*and* reports every capability the script depends on, because a missing
+extractor otherwise shows up eighty URLs into a run as a wall of `FAILED` —
+by which point an hour is spent and the operator is debugging the wrong
+thing. It exits 3 if the service is unreachable or a required dependency is
+absent; an absent optional extra is reported and does not fail the check.
 
 Exit codes:
 
@@ -48,9 +67,49 @@ Exit codes:
 
 A `FAILED` file is not a run error. Never delete one — the citation-audit
 agent grades those citations `INACCESSIBLE`, which is truthful. Removing
-them fakes coverage. Binary responses (PDFs, images) are recorded as
-`FAILED (binary content-type …)`; fall back to the PDF guidance in
-`SKILL.md §Expect Source Failures`.
+them fakes coverage.
+
+**PDFs are fetched and extracted like any other page.** Legislation,
+gazettes, court statistics and intergovernmental reports publish as PDF, so
+this is the Tier 1 half of most source pools, not an edge case. Three
+distinct outcomes, and the distinction matters to an audit:
+
+| Status | Meaning |
+|---|---|
+| `OK` | text layer extracted; treat exactly as an HTML page |
+| `OK [truncated at 400 of N pages]` | a long document; the tail is absent, so do not cite a claim as "not stated" |
+| `OK (OCR — transcription, not verbatim source…)` | a scanned PDF read by OCR; see below |
+| `FAILED (no text layer …)` | scanned, and OCR is unavailable or found nothing; the source is real and unread, not empty |
+
+**OCR output is never a quotable string.** When a PDF has no text layer,
+pages are rendered and OCR'd — mechanical, but lossy. A misread digit in a
+tax rate produces a plausible wrong number, and the citation-audit agent
+compares the deliverable against this same file, so the error would be
+confirmed rather than caught. Use an `OK (OCR …)` body as evidence that a
+claim is supported; go to the original for any figure or quotation you
+intend to publish, and say in the citation that the text was OCR-derived.
+OCR is capped at 20 pages (about 4 s per page) against 400 for a text layer.
+
+It needs an optional extra, about 180 MB on disk. This is operator setup —
+run it in the skill directory, not in the research repo:
+
+```
+cd ~/.claude/skills/cited-research && .venv/bin/python -m pip install -e ".[ocr]"
+```
+
+Without it, scanned PDFs report `FAILED` and name the install. `--check`
+says which state you are in.
+
+Other binary responses (images, archives) are still recorded as
+`FAILED (binary content-type …)`.
+
+**A near-empty HTML extraction is recorded as a failure**, not as a
+successful fetch of nothing:
+`FAILED (empty after extraction, N chars — likely a JS-rendered page or a
+challenge interstitial)`. A JS-rendered page returns its shell and no prose;
+grading that as `OK` produces a source that supports nothing while counting
+toward coverage. The rule is HTML-only — a terse JSON response is a real
+answer.
 
 ## Why persistence is out of agent prompts
 

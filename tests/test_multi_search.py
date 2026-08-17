@@ -11,6 +11,17 @@ import pytest
 
 from scripts import multi_search
 
+
+@pytest.fixture(autouse=True)
+def no_backoff_sleep(monkeypatch):
+    """Make retry backoff instant.
+
+    Every failure path now retries with real sleeps, which would otherwise
+    add seconds per failing-wave test for no coverage.
+    """
+    monkeypatch.setattr(multi_search, "_sleep_backoff", lambda attempt: None)
+
+
 # ---------------------------------------------------------------------------
 # deduplicate()
 # ---------------------------------------------------------------------------
@@ -326,9 +337,13 @@ def test_search_ddg_passes_one_wave_per_call():
     with patch.dict("sys.modules", {"ddgs": MagicMock(DDGS=lambda: fake_ddgs)}):
         multi_search.search_ddg("q", limit=5, backends="duckduckgo,brave")
     calls = fake_ddgs.__enter__.return_value.text.call_args_list
-    assert len(calls) == 2, "both waves must be queried"
-    assert calls[0].kwargs["backend"] == "duckduckgo"
-    assert calls[1].kwargs["backend"] == "brave"
+    # Both waves are queried, and never in one combined call. Count is not
+    # asserted: an empty result is retried, so a dead engine is called more
+    # than once per wave.
+    backends = [c.kwargs["backend"] for c in calls]
+    assert set(backends) == {"duckduckgo", "brave"}, "both waves must be queried"
+    assert backends[0] == "duckduckgo", "wave A runs first"
+    assert "duckduckgo,brave" not in backends, "waves must not be combined"
     assert calls[0].kwargs["max_results"] == 5
 
 
@@ -401,14 +416,18 @@ class TestRunHealth:
         assert code == 1
         assert "two independent waves" in capsys.readouterr().err
 
-    def test_empty_result_counts_as_dead(self, capsys):
+    def test_empty_result_counts_as_dead_and_says_why(self, capsys):
+        """An engine that answers with nothing is dead, and the reason shows."""
         fake_ddgs = MagicMock()
         fake_ddgs.__enter__.return_value.text.return_value = []
         mods = {"ddgs": MagicMock(DDGS=lambda: fake_ddgs), **_registry("alpha", "beta")}
         with patch.dict("sys.modules", mods):
             code = multi_search.run_health()
         assert code == 1
-        assert "EMPTY" in capsys.readouterr().out
+        out = capsys.readouterr().out
+        assert "alpha        FAIL" in out
+        assert "no results" in out
+        assert "alive: 0/2" in out
 
     def test_missing_dependency_returns_one(self, capsys):
         with patch.dict("sys.modules", {"ddgs": None}):
@@ -515,3 +534,234 @@ class TestBackendRegistry:
         err = capsys.readouterr().err
         assert "not registered as ddgs text backends: bing" in err
         assert "falls back to auto-selection" in err
+
+
+# ---------------------------------------------------------------------------
+# with_retry()
+# ---------------------------------------------------------------------------
+
+
+class TestWithRetry:
+    def test_returns_first_success_without_retrying(self):
+        calls = []
+
+        def call():
+            calls.append(1)
+            return ["hit"]
+
+        assert multi_search.with_retry(call, "x") == ["hit"]
+        assert len(calls) == 1
+
+    def test_retries_an_empty_result_then_succeeds(self):
+        """A blocked ddgs engine and a zero-hit query look identical here."""
+        outcomes = [[], [], ["hit"]]
+        assert multi_search.with_retry(lambda: outcomes.pop(0), "x") == ["hit"]
+
+    def test_retries_an_exception_then_succeeds(self):
+        state = {"n": 0}
+
+        def call():
+            state["n"] += 1
+            if state["n"] < 3:
+                raise RuntimeError("blocked")
+            return ["hit"]
+
+        assert multi_search.with_retry(call, "x") == ["hit"]
+
+    def test_raises_carrying_the_last_failure(self):
+        def call():
+            raise RuntimeError("403 forbidden")
+
+        with pytest.raises(RuntimeError) as excinfo:
+            multi_search.with_retry(call, "brave")
+        assert "brave failed after 3 attempts" in str(excinfo.value)
+        assert "403 forbidden" in str(excinfo.value)
+
+    def test_attempts_is_honoured(self):
+        calls = []
+        with pytest.raises(RuntimeError):
+            multi_search.with_retry(lambda: calls.append(1), "x", attempts=2)
+        assert len(calls) == 2
+
+
+# ---------------------------------------------------------------------------
+# scholarly parsers
+# ---------------------------------------------------------------------------
+
+
+class TestScholarlyParsers:
+    def test_openalex_abstract_is_rebuilt_in_position_order(self):
+        inverted = {"duty": [2], "transfer": [1], "Property": [0]}
+        assert multi_search.openalex_abstract(inverted) == "Property transfer duty"
+
+    def test_openalex_abstract_tolerates_a_missing_index(self):
+        assert multi_search.openalex_abstract(None) == ""
+        assert multi_search.openalex_abstract([]) == ""
+
+    def test_openalex_prefers_doi_over_landing_page(self):
+        payload = {
+            "results": [
+                {
+                    "display_name": "A paper",
+                    "doi": "https://doi.org/10.1/x",
+                    "id": "https://openalex.org/W1",
+                    "primary_location": {"landing_page_url": "https://pub.example/x"},
+                    "abstract_inverted_index": {"Hello": [0]},
+                }
+            ]
+        }
+        (record,) = multi_search.parse_openalex(payload)
+        assert record["url"] == "https://doi.org/10.1/x"
+        assert record["title"] == "A paper"
+        assert record["snippet"] == "Hello"
+
+    def test_openalex_falls_back_when_there_is_no_doi(self):
+        payload = {
+            "results": [
+                {
+                    "display_name": "B",
+                    "primary_location": {"landing_page_url": "https://p"},
+                },
+                {"display_name": "C", "id": "https://openalex.org/W2"},
+                {"display_name": "no url at all"},
+            ]
+        }
+        urls = [r["url"] for r in multi_search.parse_openalex(payload)]
+        assert urls == ["https://p", "https://openalex.org/W2"]
+
+    def test_crossref_strips_jats_markup_from_the_abstract(self):
+        payload = {
+            "message": {
+                "items": [
+                    {
+                        "URL": "https://doi.org/10.2/y",
+                        "title": ["Second paper"],
+                        "abstract": (
+                            "<jats:p>Real <jats:italic>text</jats:italic></jats:p>"
+                        ),
+                    }
+                ]
+            }
+        }
+        (record,) = multi_search.parse_crossref(payload)
+        assert record["url"] == "https://doi.org/10.2/y"
+        assert record["title"] == "Second paper"
+        assert record["snippet"] == "Real text"
+
+    def test_crossref_handles_missing_title_and_abstract(self):
+        payload = {"message": {"items": [{"URL": "https://doi.org/10.3/z"}]}}
+        (record,) = multi_search.parse_crossref(payload)
+        assert record["title"] == ""
+        assert record["snippet"] == ""
+
+    def test_wikipedia_builds_an_article_url_and_strips_match_markup(self):
+        payload = {
+            "query": {
+                "search": [
+                    {
+                        "title": "Taxation in Spain",
+                        "snippet": 'The <span class="searchmatch">rate</span> is 24%',
+                    }
+                ]
+            }
+        }
+        (record,) = multi_search.parse_wikipedia_fulltext(payload)
+        assert record["url"] == "https://en.wikipedia.org/wiki/Taxation_in_Spain"
+        assert record["snippet"] == "The rate is 24%"
+
+    def test_parsers_tolerate_an_empty_payload(self):
+        for parse in multi_search._SCHOLARLY_PARSERS.values():
+            assert parse({}) == []
+
+
+# ---------------------------------------------------------------------------
+# scholarly engine
+# ---------------------------------------------------------------------------
+
+
+class TestSearchScholarly:
+    def test_one_dead_source_does_not_kill_its_wave(self, capsys):
+        """openalex and wikipedia share wave A; one failing must not lose both."""
+
+        def fake_fetch_json(url):
+            if "openalex" in url:
+                raise RuntimeError("502 upstream error")
+            if "wikipedia" in url:
+                return {"query": {"search": [{"title": "T", "snippet": "s"}]}}
+            return {
+                "message": {"items": [{"URL": "https://doi.org/1", "title": ["C"]}]}
+            }
+
+        with patch.object(multi_search, "_fetch_json", side_effect=fake_fetch_json):
+            payload = multi_search.search_scholarly("q", 5)
+
+        urls = [r["url"] for r in payload["results"]]
+        assert "https://en.wikipedia.org/wiki/T" in urls
+        assert "https://doi.org/1" in urls
+        assert "openalex failed" in capsys.readouterr().err
+
+    def test_waves_are_labelled_so_they_cannot_collide_with_ddg(self):
+        with patch.object(multi_search, "_fetch_json", return_value={}):
+            payload = multi_search.search_scholarly("q", 5)
+        cov = payload["coverage"]
+        assert cov["wave_a_backends"] == "openalex,wikipedia-fulltext"
+        assert cov["wave_b_backends"] == "crossref"
+        for entry in cov["waves_failed"]:
+            assert entry["wave"].startswith("scholarly:")
+
+    def test_fetch_service_exit_becomes_a_wave_failure_not_a_process_exit(self):
+        """A dead fetch service must not discard ddg results already in hand."""
+        with patch("scripts.fetch_url.fetch", side_effect=SystemExit(3)):
+            payload = multi_search.search_scholarly("q", 5)
+        assert payload["results"] == []
+        assert payload["coverage"]["single_wave"] is False
+        assert payload["coverage"]["waves_ok"] == []
+
+
+# ---------------------------------------------------------------------------
+# merge_coverage()
+# ---------------------------------------------------------------------------
+
+
+class TestMergeCoverage:
+    def test_single_engine_keeps_its_block_unchanged(self):
+        cov = {"waves_ok": ["A"], "single_wave": True}
+        assert multi_search.merge_coverage({"ddg": cov}) is cov
+
+    def test_two_engines_aggregate_into_two_independent_samples(self):
+        merged = multi_search.merge_coverage(
+            {
+                "ddg": {
+                    "waves_ok": ["A"],
+                    "waves_failed": [{"wave": "B", "error": "x"}],
+                    "wave_a_backends": "brave",
+                    "wave_b_backends": "yahoo",
+                    "returned_by_wave": {"A": 10},
+                    "single_wave": True,
+                },
+                "scholarly": {
+                    "waves_ok": ["scholarly:A"],
+                    "waves_failed": [],
+                    "wave_a_backends": "openalex,wikipedia-fulltext",
+                    "wave_b_backends": "crossref",
+                    "returned_by_wave": {"scholarly:A": 5},
+                    "single_wave": True,
+                },
+            }
+        )
+        assert merged["independent_samples"] == 2
+        assert merged["single_wave"] is False
+        assert merged["waves_ok"] == ["A", "scholarly:A"]
+        assert merged["returned_by_wave"] == {"A": 10, "scholarly:A": 5}
+        assert merged["wave_a_backends"] == "brave,openalex,wikipedia-fulltext"
+        assert set(merged["engines"]) == {"ddg", "scholarly"}
+
+    def test_one_engine_answering_out_of_two_is_still_single_wave(self):
+        merged = multi_search.merge_coverage(
+            {
+                "ddg": {"waves_ok": [], "waves_failed": [{"wave": "A"}]},
+                "scholarly": {"waves_ok": ["scholarly:B"], "waves_failed": []},
+            }
+        )
+        assert merged["single_wave"] is True
+        assert merged["independent_samples"] == 1

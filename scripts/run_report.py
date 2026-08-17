@@ -27,7 +27,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from scripts import _data_paths
+from scripts import _data_paths, run_meta
 
 # Severity order, best to worst. Grades print in this order, never by count.
 GRADES = ("VERIFIED", "PARTIAL", "INACCURATE", "INACCESSIBLE", "NOT FOUND")
@@ -71,6 +71,12 @@ class FetchStats:
     failed: int = 0
     refs: int = 0
     reasons: Counter = field(default_factory=Counter)
+    # Host-level failures are what an operator can act on: a host that refuses
+    # every request needs a different route or a policy entry, whereas a
+    # scattering of 404s is just link rot and needs nothing.
+    failed_hosts: Counter = field(default_factory=Counter)
+    ok_urls: set = field(default_factory=set)
+    empty_ok: int = 0
 
 
 @dataclass
@@ -171,16 +177,47 @@ def read_fetched(slug_root: Path) -> "FetchStats":
         m = re.search(r"^# Status: (OK|FAILED)(.*)$", head, re.MULTILINE)
         if not m:
             continue
+        text = f.read_text(errors="replace")
+        url_m = re.match(r"# Fetched: (\S+)", text)
+        url = url_m.group(1) if url_m else ""
+        host = ""
+        if url:
+            host = url.split("//")[-1].split("/")[0]
         stats.total += 1
         if m.group(1) == "OK":
             stats.ok += 1
+            if url:
+                stats.ok_urls.add(url)
+            # A page that fetched cleanly but carries no body is a JS-rendered
+            # shell or a bot challenge. It grades OK and supports nothing, which
+            # is more dangerous than a clean failure because it looks like
+            # evidence. Count it separately.
+            #
+            # `fetch_url.py` now records these as FAILED at fetch time, so this
+            # is a backstop rather than the primary detector — it still catches
+            # `put_data.py` writes and files from earlier runs. A non-zero count
+            # on a fresh run means something wrote an OK file that fetch_url
+            # did not.
+            body = text.split("\n\n", 1)[1] if "\n\n" in text else ""
+            if len(body.strip()) < 200:
+                stats.empty_ok += 1
         else:
             stats.failed += 1
             code = re.search(r"\((\d{3})", m.group(2))
             stats.reasons[code.group(1) if code else "other"] += 1
+            if host:
+                stats.failed_hosts[host] += 1
     for f in fetched.glob("*.refs"):
         stats.refs += len([ln for ln in f.read_text().splitlines() if ln.strip()])
     return stats
+
+
+def cited_urls(deliverable: Path) -> set:
+    """Every URL that appears inside an angle-bracket link in citations.md."""
+    path = deliverable / "citations.md"
+    if not path.is_file():
+        return set()
+    return set(re.findall(r"<(https?://[^>\s]+)>", path.read_text()))
 
 
 def read_citations(deliverable: Path) -> "CiteStats":
@@ -238,12 +275,19 @@ def read_audit(deliverable: Path) -> Counter:
     return grades
 
 
-def build_report(slug: str, slug_root: Path, deliverable: Path) -> str:
+def build_report(
+    slug: str,
+    slug_root: Path,
+    deliverable: Path,
+    since: str = "",
+    rates_path: Path | None = None,
+) -> str:
     outcomes, dropped = read_agents(slug_root)
     search = read_search(slug_root)
     fetched = read_fetched(slug_root)
     cites = read_citations(deliverable)
     grades = read_audit(deliverable)
+    cited = cited_urls(deliverable)
 
     lines = [f"cited-research run report — {slug}", "=" * 60, "", "AGENTS"]
     dispatched = sum(outcomes.values())
@@ -292,6 +336,25 @@ def build_report(slug: str, slug_root: Path, deliverable: Path) -> str:
         lines += _rows("failure codes", fetched.reasons, gloss=HTTP_MEANING)
         if fetched.refs:
             lines.append(f"    encyclopedia refs harvested {fetched.refs:>4}")
+        if fetched.empty_ok:
+            lines.append(
+                f"  ! {fetched.empty_ok} fetched OK but returned a near-empty body "
+                "(JS-rendered or challenge page) — these grade as successes and "
+                "support nothing"
+            )
+        if fetched.failed_hosts:
+            blocking = [(h, n) for h, n in fetched.failed_hosts.most_common() if n > 1]
+            if blocking:
+                lines.append("  hosts failing more than once — candidates for a")
+                lines.append("  policy entry or a different retrieval route:")
+                for host, n in blocking[:12]:
+                    lines.append(f"    {host:<44} {n:>3}")
+        unused = fetched.ok_urls - cited
+        if unused:
+            lines.append(
+                f"  {len(unused)} pages fetched successfully but never cited "
+                f"({len(unused) / max(fetched.ok, 1):.0%} of usable fetches)"
+            )
 
     lines += ["", "CITATIONS"]
     if not cites.defined:
@@ -322,6 +385,13 @@ def build_report(slug: str, slug_root: Path, deliverable: Path) -> str:
         if unchecked > 0:
             lines.append(f"    ! {unchecked} citations never audited")
 
+    # Token accounting reads the CLI's own transcript on disk. It never touches
+    # the network, which is what keeps it compatible with a sandbox that
+    # deliberately blocks telemetry egress.
+    stats = run_meta.read_tokens(run_meta.project_dir(), since=since)
+    rates = run_meta.load_rates(rates_path)
+    lines += [""] + run_meta.render(stats, rates, run_meta.environment())
+
     return "\n".join(lines)
 
 
@@ -333,6 +403,19 @@ def main() -> None:
         default=None,
         help="deliverable directory (default: research/<slug>)",
     )
+    parser.add_argument(
+        "--since",
+        default="",
+        help="ISO timestamp lower bound for token accounting (scopes the run)",
+    )
+    parser.add_argument(
+        "--rates", default=None, help="JSON rate file for USD estimation"
+    )
+    parser.add_argument(
+        "--no-write",
+        action="store_true",
+        help="print only; do not write report.md into the deliverable directory",
+    )
     args = parser.parse_args()
 
     slug_root = _data_paths.DATA_ROOT / args.slug
@@ -341,7 +424,30 @@ def main() -> None:
         if args.deliverable_dir
         else Path.cwd() / "research" / args.slug
     )
-    print(build_report(args.slug, slug_root, deliverable))
+    report = build_report(
+        args.slug,
+        slug_root,
+        deliverable,
+        since=args.since,
+        rates_path=Path(args.rates) if args.rates else None,
+    )
+    print(report)
+
+    # The report is a durable artifact, not just terminal output: it ships beside
+    # citations.md so the run's own measurements travel with the research rather
+    # than living in a scrollback the reader never sees.
+    if not args.no_write and deliverable.is_dir():
+        target = deliverable / "report.md"
+        body = (
+            "<!-- Generated by scripts/run_report.py — do not edit by hand. -->\n\n"
+            f"# Run report — {args.slug}\n\n"
+            "Counted from the artifacts this run left on disk. Regenerate with\n"
+            "`run_report.py <slug>`; the same run always produces the same report.\n"
+            "Lines marked `!` are findings to fix or disclose.\n\n"
+            "```\n" + report + "\n```\n"
+        )
+        target.write_text(body)
+        print(f"\nwrote {target}", file=sys.stderr)
     if not slug_root.is_dir() and not deliverable.is_dir():
         print(
             f"\nError: neither {slug_root} nor {deliverable} exists.",

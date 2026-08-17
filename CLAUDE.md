@@ -142,9 +142,47 @@ anti-bot challenge.
 
 When changing this script:
 
-- Keep it stdlib-only. It runs before `make install-dev` might have been
-  re-run, and adding a dependency to the fetch path makes the skill fail
-  in exactly the situation where it is least debuggable.
+- Keep it stdlib-only, with exactly one exception. It runs before
+  `make install-dev` might have been re-run, and adding a dependency to
+  the fetch path makes the skill fail in exactly the situation where it is
+  least debuggable. The exception is `pypdf`, and it is imported *inside*
+  `pdf_to_text` rather than at module scope, so a missing install degrades
+  to `FAILED (pypdf not installed …)` on PDF fetches only and leaves every
+  HTML fetch working. The OCR extra follows the same rule and is optional
+  on top of that. Any further dependency must meet the same bar: worth the
+  cost, and import-guarded so its absence cannot take the script down.
+- `scripts/explore/` is investigation. The test is whether acting on the
+  output means editing code or running a query: probing search backends that
+  are *not* integrated feeds a parser, so it is exploration; asking whether
+  the configured backends are alive is `multi_search.py --health`, so it is
+  runtime. A script that graduates to runtime leaves `explore/`, loses the
+  coverage exemption and gains tests. Being copied into
+  `~/.claude/skills/` is not that graduation and is not worth preventing —
+  the deploy copies the repo, the files cost nothing there, and blocking it
+  buys no safety.
+- Shipped docs (`SKILL.md`, `references/`, `agents/`) must never give a
+  command that assumes a cwd or a repo. The cwd during a run is the user's
+  research repo, which has its own `scripts/` — a bare `scripts/fetch_url.py`
+  silently resolves to a different project rather than erroring, and `make
+  <target>` needs a cwd nobody is in. Invoke through
+  `$SKILL/.venv/bin/python $SKILL/scripts/<name>.py`, and spell out `cd` for
+  operator setup steps. Makefile targets are for this repo, not for a run.
+- Every optional capability must appear in `CAPABILITIES` so `--check`
+  reports it. The rule is that a dependency problem is discovered at
+  preflight, never eighty URLs into a run — the cost of the late discovery
+  is the whole run, and it presents as "the web is broken" rather than as
+  "one pip install is missing".
+- OCR text must keep its `OK (OCR …)` status marker. The citation-audit
+  agent compares the deliverable against the fetched file; if OCR corrupts
+  a digit, the deliverable inherits it and the audit *confirms* it, because
+  both read the same corrupted text. The marker is the only thing telling a
+  downstream reader that this body is a transcription rather than a source.
+  `rapidocr-onnxruntime` resolves `opencv-python` by default, which needs
+  `libGL.so.1` and fails on import in a headless container — the extra pins
+  `opencv-python-headless` for that reason. Do not drop that pin.
+- Keep the body as `bytes` from `fetch` through to `render`. Decoding in
+  `fetch` is the obvious simplification and it destroys every PDF, which
+  is the Tier 1 half of a typical source pool.
 - Preserve the 403 disambiguation. A `403` whose body starts `refused:`
   is the service declining one URL (recoverable, recorded as `FAILED`);
   any other `403` is the proxy refusing the service address itself
@@ -168,6 +206,11 @@ When changing this script:
   back into prose instructions for the model — instructions cost tokens
   on every run and depend on the model complying; parsing is
   deterministic and free.
+- A `Status: OK` file with no content is the failure mode to keep guarding
+  against. Two paths produce it and both are now recorded as `FAILED`: a
+  JS-rendered page whose HTML is a shell, and a scanned PDF with no text
+  layer. Both grade to an audit agent as "the source said nothing", which
+  is a different and wrong claim from "the source could not be read".
 
 Behavior contract and operator-facing docs live in
 `references/data-persistence.md`. The service itself is documented in
@@ -197,6 +240,37 @@ When changing it:
 `SKILL.md` requires the coordinator to paste the output verbatim into its
 reply. That instruction exists because running the script does not show it
 to anyone — command output reaches the model, not reliably the user.
+
+The script also **writes `report.md` into the deliverable directory**, as a
+peer of `citations.md`. Terminal output scrolls away and a pasted block lives
+only in one conversation; the run's own measurements should travel with the
+research. `--no-write` suppresses it for a dry run.
+
+### Token accounting must stay local
+
+`scripts/run_meta.py` reads token counts from the CLI's session transcripts at
+`~/.claude/projects/<encoded-cwd>/*.jsonl` (`message.usage`), plus subagent
+totals from the `<subagent_tokens>` marker in Agent tool results. **This is a
+file read and must remain one.** A sandbox whose network policy deliberately
+blocks the OTEL collector must not gain a back door to the same data through
+the fetch service — do not add a telemetry query, a Prometheus call, or any
+network path to this module.
+
+Two consequences worth preserving:
+
+- **Scope by timestamp window, not session id.** A run that outlives a
+  container restart continues in a new session file; scoping by id truncates
+  the report at the restart, which is the same blind spot the status line has.
+  `render()` prints a `!` line when a run spans more than one session.
+- **Never hardcode prices.** No local artifact contains cost. Rates are read
+  from an operator-owned JSON file via `--rates` or `CITED_RESEARCH_RATES`,
+  and with no rate file the report prints tokens and says money is unpriced.
+  A stale constant would produce a confident wrong number, which is worse
+  than no number.
+
+Cache reads dominate the raw token total by an order of magnitude and are
+priced differently everywhere, so the headline figure is **billable tokens**
+(input + output + cache creation) with the components printed underneath.
 
 ## Data Persistence Wrappers
 
