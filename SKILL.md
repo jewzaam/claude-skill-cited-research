@@ -250,17 +250,38 @@ An agent that returned nothing, timed out, or hit a tool budget is a loss of
 signal, and it is invisible afterwards unless recorded here. The run report
 counts this file.
 
+**Every script path in this file is relative to the installed skill, never
+to the working directory.** The cwd during a run is the user's research
+repo, which has its own `scripts/` — a bare `scripts/fetch_url.py` resolves
+there and finds a different project's files. Always invoke through the
+skill's own interpreter, which is also what makes `from scripts...` imports
+resolve:
+
+```
+SKILL=~/.claude/skills/cited-research
+$SKILL/.venv/bin/python $SKILL/scripts/<name>.py ...     # git-bash: .venv/Scripts/python.exe
+```
+
+`ModuleNotFoundError: No module named 'scripts'` means that venv exists but
+the package was never installed into it — see §Prerequisite below.
+
 **Preflight.** Before the first page read of a run, establish which
 retrieval path works:
 
 1. Try `WebFetch` on the first URL. If it succeeds, use it for the whole
    run and persist each page with `put_data.py`.
 2. If it fails with `Socket is closed`, this is a sandbox. Check the
-   host-side fetch service with `scripts/fetch_url.py --check`.
+   host-side fetch service with `$SKILL/scripts/fetch_url.py --check`.
 3. If that exits non-zero, stop and tell the operator. No pages can be
    read, and that must surface before agents are dispatched rather than
    as a wall of failures afterward. Do not route around it — there is no
    other egress for arbitrary hosts.
+4. `--check` also reports every capability. `MISSING pypdf` exits non-zero
+   too, and means the same thing in practice: PDFs are the Tier 1 half of
+   most source pools, so proceeding would bias the run toward the very tier
+   this method exists to avoid. Fix it before dispatching, not after. An
+   `absent` optional line (OCR) is a reduced capability, not a stop — but
+   report it, because scanned sources will fail.
 
 Invocation and exit codes are in
 [`references/data-persistence.md`](references/data-persistence.md); the
@@ -341,6 +362,29 @@ Write each query's JSON output into the topic's `search/` directory via
 
 Do not report a run as multi-engine when coverage says otherwise.
 
+*Step 2a — scholarly APIs (optional, per dimension).*
+
+```
+... multi_search.py --query "..." --engines ddg,scholarly --backends <live list>
+```
+
+The `scholarly` engine queries OpenAlex, Crossref and Wikipedia full-text as
+keyless JSON APIs through the fetch service. They have no anti-bot layer, so
+they answer on days when every ddgs scraper is blocked, and they are Tier 1-2
+by construction. OpenAlex snippets are the publisher's own abstract; Crossref
+often carries none at all.
+
+Two limits, both load-bearing:
+
+- **It is not a web index.** It finds peer-reviewed analysis, treaty text and
+  statistics. It will not find a government fee schedule or a tax authority's
+  rate page. Adding it does not make a dimension web-sourced.
+- **It does not lift the stop condition.** `scholarly` waves count toward
+  `independent_samples`, so a run with one live scraper plus `scholarly` will
+  report two or more samples. That is honest about sampling and silent about
+  the web: claims about current regulation still need a web engine behind
+  them. Judge the ddgs backend count separately.
+
 *Step 2b — encyclopedia sweep (optional, once per dimension).*
 
 ```
@@ -356,9 +400,7 @@ writes its outbound citation links to a `<name>.refs` sidecar — one URL per
 line, ready to feed straight back into the fetch queue:
 
 ```
-while read -r u; do
-    ... fetch_url.py <slug> "fetched/ref-$n.md" "$u"
-done < .tmp-cited-research/<slug>/fetched/<name>.md.refs
+... fetch_url.py --batch <slug> < .tmp-cited-research/<slug>/fetched/<name>.md.refs
 ```
 
 Those references are the sources to cite. The article itself is tertiary —
@@ -396,9 +438,18 @@ search cannot discover sources, so:
    diversity but not result volume. That degrades; it does not halt —
    record it in Limitations.
 
-Prerequisite: the skill's `.venv` is populated once via `make install-dev`
-inside `~/.claude/skills/cited-research/`. Without it there is no search at
-all — treat a missing venv the same as total backend failure.
+Prerequisite: the skill's `.venv` is populated once, and this is operator
+setup — do it in the skill directory, not the research repo:
+
+```
+cd ~/.claude/skills/cited-research
+python3 -m venv .venv && .venv/bin/python -m pip install -e .
+.venv/bin/python -m pip install -e ".[ocr]"   # optional, scanned PDFs
+```
+
+`pip install -e .` rather than a plain dependency install because the
+scripts import each other as a package. Without the venv there is no search
+at all — treat a missing venv the same as total backend failure.
 
 84.9% of search results are unique to a single engine [§Multi-Engine Search
 Diversity in `references/research-basis.md`], which is why the multi-engine
@@ -512,9 +563,28 @@ sources per data point planned in Phase 0 Step 3 provide the redundancy needed
 to absorb this failure rate. Above 50% inaccessibility may indicate the topic
 lacks accessible web sources — adjust the scope.
 
-When PDFs fail to extract, search for the paper's title plus the specific data
-point needed, check PubMed abstracts, or look for citing secondary sources.
-Never silently drop a source — record the gap visibly in the citation entry.
+PDFs are extracted like any other page, so a PDF is not itself a failure.
+A scanned PDF falls back to OCR when the extra is installed; the status then
+reads `OK (OCR — transcription, not verbatim source)`. **Do not quote from an
+OCR body and do not lift a figure out of one** — a misread digit is a
+plausible wrong number, and the citation audit reads the same file, so it
+confirms the error rather than catching it. Use it to establish that a claim
+is supported, then cite the original and mark the entry OCR-derived.
+
+`FAILED (no text layer …)` means scanned with no OCR available. That source
+exists and is unread — search for its title plus the specific data point
+needed, check PubMed abstracts, or look for citing secondary sources. Never
+silently drop a source — record the gap visibly in the citation entry.
+
+Two statuses that look like failures but are the system working, and must be
+read literally rather than retried:
+
+- `FAILED (empty after extraction, N chars …)` — the page rendered its
+  content in JavaScript. Refetching gets the same shell. Find the underlying
+  document, often a PDF or an API endpoint linked from that page.
+- `FAILED (403 …)` — some hosts block the fetch service by policy rather
+  than intermittently. Two failures on the same host means stop spending
+  retries on it; `run_report.py` ranks repeat-failing hosts for exactly this.
 
 ## Phase 2: Organization
 
@@ -736,10 +806,20 @@ After the audits are promoted, print the run report:
     ~/.claude/skills/cited-research/scripts/run_report.py <topic-slug>
 ```
 
-It counts agent losses, engines used, fetch outcomes, citation tiers, and
-verified-vs-not from the artifacts on disk.
+It counts agent losses, engines used, fetch outcomes, citation tiers,
+verified-vs-not, token cost and wall clock from the artifacts on disk, and
+**writes `report.md` into the deliverable directory** beside `citations.md` so
+the run's own measurements ship with the research.
+
+Token accounting reads the CLI's session transcript on disk — it never queries
+a telemetry endpoint, which is what lets it work in a sandbox that blocks one.
+Currency needs a rate file you supply (`--rates`, or `CITED_RESEARCH_RATES`);
+without one the report prints tokens and says money is unpriced rather than
+guessing a price.
 
 **Paste the report into your reply, inside a fenced code block, in full.**
+(Writing `report.md` does not discharge this — a file in the repo is not
+something the reader has seen.)
 Running the command is not showing it. Command output goes to the model, not
 reliably to the user — a user reading the conversation sees nothing unless
 the text is in the response body. Copy every line, including the sections

@@ -256,3 +256,61 @@ def test_engines_and_codes_still_sort_by_frequency(run_dirs):
     counter = run_report.Counter({"rare": 1, "common": 9, "mid": 5})
     rows = run_report._rows("engines", counter)
     assert [r.split()[0] for r in rows] == ["common", "mid", "rare"]
+
+
+# ---------------------------------------------------------------------------
+# host-level failure tracking, empty-OK detection, uncited pages
+
+
+def test_fetch_records_failing_hosts_and_empty_ok_bodies(run_dirs):
+    """A near-empty OK body is a silent failure and must not read as a success."""
+    slug_root, _ = run_dirs
+    fetched = slug_root / "fetched"
+    (fetched / "a.md").write_text(
+        "# Fetched: https://blocked.example/one\n# Date: now\n"
+        "# Status: FAILED (403: denied)\n\nbody\n"
+    )
+    (fetched / "b.md").write_text(
+        "# Fetched: https://blocked.example/two\n# Date: now\n"
+        "# Status: FAILED (403: denied)\n\nbody\n"
+    )
+    (fetched / "c.md").write_text(
+        "# Fetched: https://js.example/shell\n# Date: now\n# Status: OK\n\n\n"
+    )
+    (fetched / "d.md").write_text(
+        "# Fetched: https://good.example/page\n# Date: now\n# Status: OK\n\n"
+        + ("real content " * 40)
+        + "\n"
+    )
+    stats = run_report.read_fetched(slug_root)
+    assert stats.failed_hosts["blocked.example"] == 2
+    assert stats.empty_ok == 1
+    assert "https://good.example/page" in stats.ok_urls
+    assert "https://js.example/shell" in stats.ok_urls
+
+
+def test_cited_urls_reads_angle_bracket_links(run_dirs):
+    _, deliverable = run_dirs
+    (deliverable / "citations.md").write_text(
+        "**[1]** A source.\n<https://good.example/page>\n**Tier:** 1\n"
+    )
+    assert run_report.cited_urls(deliverable) == {"https://good.example/page"}
+
+
+def test_report_flags_uncited_fetches_and_blocking_hosts(run_dirs):
+    slug_root, deliverable = run_dirs
+    fetched = slug_root / "fetched"
+    for i in range(2):
+        (fetched / f"f{i}.md").write_text(
+            f"# Fetched: https://blocked.example/{i}\n# Date: now\n"
+            "# Status: FAILED (403: denied)\n\nx\n"
+        )
+    (fetched / "ok.md").write_text(
+        "# Fetched: https://never-cited.example/p\n# Date: now\n# Status: OK\n\n"
+        + ("content " * 60)
+        + "\n"
+    )
+    (deliverable / "citations.md").write_text("**[1]** X\n<https://other.example/>\n")
+    out = run_report.build_report("topic", slug_root, deliverable)
+    assert "blocked.example" in out
+    assert "never cited" in out

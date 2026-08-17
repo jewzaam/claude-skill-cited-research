@@ -14,9 +14,24 @@ authors = [
 ]
 dependencies = [
     "ddgs>=9.0,<10.0",
+    # Legislation, gazettes and statistics releases publish as PDF; without
+    # an extractor the Tier 1 half of a source pool is unreadable.
+    "pypdf>=5.0",
 ]
 
 [project.optional-dependencies]
+# Reading scanned PDFs. Kept out of the base install because it resolves to
+# about 180 MB on disk (onnxruntime 58, opencv 72, models 14, pdfium 8) and
+# most runs never hit a scanned source; `fetch_url.py --check` reports whether
+# it is present.
+ocr = [
+    "pypdfium2>=4.0",
+    "rapidocr-onnxruntime>=1.2",
+    # The default `opencv-python` that rapidocr resolves needs libGL.so.1,
+    # which a headless container does not have. Pinning the headless build
+    # is the difference between working and ImportError at first scanned PDF.
+    "opencv-python-headless>=4.8",
+]
 dev = [
     "pytest>=7.0",
     "pytest-cov>=4.0",
@@ -35,6 +50,12 @@ markers = [
     "live: hits real network (deselected by default; run with `make test-live`)",
 ]
 addopts = "-m 'not live'"
+
+[tool.coverage.run]
+# scripts/explore/ holds one-off investigation tools kept for reproducibility,
+# not shipped behaviour. Counting them would push the coverage gate toward
+# writing tests for throwaway probes.
+omit = ["scripts/explore/*"]
 
 [tool.mypy]
 ignore_missing_imports = true
