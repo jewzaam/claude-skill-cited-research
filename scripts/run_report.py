@@ -388,9 +388,27 @@ def build_report(
     # Token accounting reads the CLI's own transcript on disk. It never touches
     # the network, which is what keeps it compatible with a sandbox that
     # deliberately blocks telemetry egress.
+    #
+    # Default the lower bound to this run's own start. Without it the read spans
+    # every session that ever ran in this project directory, which is how a 1.7h
+    # run once reported 173.8h and a 15x token count.
+    scope_note = ""
+    if since:
+        scope_note = f"  scoped from {since} (--since)"
+    else:
+        since, signal = run_meta.run_start(slug_root)
+        if since:
+            scope_note = f"  scoped from {since} ({signal})"
+        else:
+            scope_note = (
+                "  ! run start not found in artifacts — figures below may "
+                "include other sessions in this project directory"
+            )
     stats = run_meta.read_tokens(run_meta.project_dir(), since=since)
     rates = run_meta.load_rates(rates_path)
-    lines += [""] + run_meta.render(stats, rates, run_meta.environment())
+    meta_lines = run_meta.render(stats, rates, run_meta.environment())
+    meta_lines.insert(1, scope_note)
+    lines += [""] + meta_lines
 
     return "\n".join(lines)
 
