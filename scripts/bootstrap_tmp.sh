@@ -49,4 +49,13 @@ printf '*' > "$PARENT/.gitignore"
 rm -rf "$WORK_DIR"
 mkdir -p "$WORK_DIR"
 
+# Record the run's start time. run_report.py scopes token accounting to this
+# bound; without it the report spans every session that ever ran in the same
+# project directory, because /clear starts a new conversation but not a new
+# project directory. Recorded rather than inferred: the directory's own birth
+# time would be exact, but CPython on Linux does not expose st_birthtime, and
+# the earliest artifact lands minutes late — late enough to drop the first
+# agents dispatched.
+date -u +%Y-%m-%dT%H:%M:%S.%3NZ > "$WORK_DIR/started"
+
 echo "bootstrap_tmp: $WORK_DIR ready (wiped)"

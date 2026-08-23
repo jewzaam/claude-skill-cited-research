@@ -14,9 +14,15 @@ Three sources, in order of usefulness:
 
 1. **Session transcripts** at `~/.claude/projects/<slug>/*.jsonl`. Assistant
    records carry `message.usage`, which is where input, output and cache token
-   counts live. Subagent totals appear separately, as `<subagent_tokens>` in the
-   Agent tool's result metadata, because sidechain records are not written to
-   the parent transcript.
+   counts live. Subagent totals appear separately in the Agent tool's result
+   metadata, because sidechain records are not written to the parent transcript.
+   Two renderings exist in the wild — see `SUBAGENT_RE`.
+
+   **Scope these by window.** A project directory accumulates every session that
+   ever ran there, and `/clear` does not start a new one, so an unscoped read
+   reports unrelated sessions as part of this run. `run_start()` derives the
+   lower bound from the run's own artifacts; `run_report.py` applies it by
+   default.
 
 2. **Environment**, for a reproducibility stamp: skill commit, `ddgs` version,
    the fetch service address.
@@ -42,7 +48,7 @@ import re
 import subprocess
 import sys
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 # Only these keys are summed. `message.usage` also carries non-numeric entries
@@ -55,7 +61,30 @@ TOKEN_KEYS = (
     "cache_read_input_tokens",
 )
 
-SUBAGENT_RE = re.compile(r"<subagent_tokens>(\d+)</subagent_tokens>")
+# Two renderings, because the CLI changed format mid-2026 and transcripts from
+# either era can sit in the same project directory. Matching only the older tag
+# form silently reported zero subagent tokens for every newer run.
+#   old: <subagent_tokens>26701</subagent_tokens>
+#   new: subagent_tokens: 207684\ntool_uses: 18   (inside a <usage> block)
+# The colon form is deliberately not anchored to what follows it — anchoring on
+# `tool_uses` was measured to miss results that omit it.
+SUBAGENT_RE = re.compile(
+    r"<subagent_tokens>(\d+)</subagent_tokens>|subagent_tokens:\s*(\d+)"
+)
+
+# Tolerates whitespace after the colon. The CLI writes compact JSON, but a
+# transcript that has been through any re-serialisation has a space there, and
+# silently matching nothing would zero out active time rather than erroring.
+TIMESTAMP_RE = re.compile(r'"timestamp":\s*"([^"]+)"')
+
+# A gap longer than this is someone not looking at the session, not work in
+# progress. Measured against a real run: the longest gap that was genuinely work
+# was 14.7 minutes (a slow subagent), and the next gap up was 48.5 hours — an
+# overnight break between sittings. Every threshold from 15 to 60 minutes gives
+# the same answer for that run, so this sits mid-band rather than on an edge.
+# Runs whose agents legitimately exceed it will say so: the report prints how
+# many gaps were excluded and how long the largest was.
+IDLE_GAP_SECONDS = 1800
 
 
 @dataclass
@@ -69,6 +98,7 @@ class TokenStats:
     last: str = ""
     models: dict = field(default_factory=dict)
     scanned_files: int = 0
+    stamps: list = field(default_factory=list)
 
     @property
     def billable(self) -> int:
@@ -104,6 +134,78 @@ def project_dir(cwd: Path | None = None) -> Path:
     return exact
 
 
+def run_start(slug_root: Path) -> tuple[str, str]:
+    """Infer when this run began, from the run's own artifacts on disk.
+
+    Returns `(iso_timestamp, signal_name)`, or `("", "")` when nothing usable
+    exists. The caller reports the signal name so a reader can see the bound was
+    inferred rather than recorded.
+
+    Why this exists: token accounting globs every transcript in the project
+    directory, and `/clear` starts a new conversation without starting a new
+    project directory. Unscoped, a run reported the span of every unrelated
+    session sharing that directory — measured once at 173.8h and 23.9M tokens
+    for a run that was actually 1.7h and 1.6M.
+
+    Preferred signal is the `started` file `bootstrap_tmp.sh` writes at the top
+    of Phase 1, which is recorded rather than inferred. The artifact-based
+    fallbacks exist for runs bootstrapped before that file was added; they land
+    minutes late, which is enough to drop the first agents dispatched — measured
+    at 16:06:21Z inferred against a true 16:03:16Z, losing four agent results.
+
+    The slug directory's own birth time would be exact too, but CPython on Linux
+    does not expose `st_birthtime`.
+
+    Deliberately not used: `agents.tsv` mtime, which tracks the *last* append
+    rather than the first, and so trails the run by its whole duration.
+    """
+    marker = slug_root / "started"
+    if marker.is_file():
+        stamp = marker.read_text(errors="replace").strip()
+        if stamp:
+            return stamp, "bootstrap_tmp.sh 'started' marker"
+
+    cands: list[tuple[str, str]] = []
+
+    search = slug_root / "search"
+    if search.is_dir():
+        stamps = [f.stat().st_mtime for f in search.iterdir() if f.is_file()]
+        if stamps:
+            cands.append((_iso(min(stamps)), "earliest search/*.json mtime"))
+
+    # Content-based, so it survives copy, rsync and filesystems that drop mtime.
+    fetched = slug_root / "fetched"
+    if fetched.is_dir():
+        earliest = ""
+        for path in fetched.glob("*.md"):
+            try:
+                head = path.read_text(errors="replace").splitlines()[:5]
+            except OSError:
+                continue
+            for line in head:
+                if line.startswith("# Date:"):
+                    stamp = line.split(":", 1)[1].strip()
+                    if stamp and (not earliest or stamp < earliest):
+                        earliest = stamp
+                    break
+        if earliest:
+            cands.append((earliest, "earliest fetched '# Date:' header"))
+
+    if not cands:
+        return "", ""
+    return min(cands)
+
+
+def _iso(epoch: float) -> str:
+    """Epoch seconds to the UTC ISO form the transcript timestamps use."""
+    return (
+        datetime.fromtimestamp(epoch, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[
+            :-3
+        ]
+        + "Z"
+    )
+
+
 def _in_window(stamp: str, since: str, until: str) -> bool:
     if not stamp:
         return not since  # undated records only count when no window is set
@@ -126,6 +228,13 @@ def read_tokens(
         for line in path.read_text(errors="replace").splitlines():
             if not line.strip():
                 continue
+            # Timestamps come off the raw line by regex, before the prefilter
+            # below drops most lines. Active time wants every record, not just
+            # the ones carrying tokens — more points means tighter gaps — and a
+            # regex avoids the json.loads that the prefilter exists to skip.
+            ts = TIMESTAMP_RE.search(line)
+            if ts and _in_window(ts.group(1), since, until):
+                stats.stamps.append(ts.group(1))
             # Cheap prefilter: most lines carry neither usage nor an agent
             # result, and json.loads on a 5 MB transcript is the slow part.
             has_usage = '"usage"' in line
@@ -141,8 +250,12 @@ def read_tokens(
                 continue
             if cwd_filter and rec.get("cwd") and cwd_filter not in rec["cwd"]:
                 continue
-            if sub:
-                stats.subagent_tokens += int(sub.group(1))
+            # Only tool results carry real subagent usage. Assistant records can
+            # contain the same literal as prose, because SKILL.md requires the
+            # run report — which prints `subagent_tokens: N` — to be pasted into
+            # the reply. Counting those would inflate every subsequent run.
+            if sub and rec.get("type") != "assistant":
+                stats.subagent_tokens += int(sub.group(1) or sub.group(2))
                 stats.subagent_count += 1
             msg = rec.get("message")
             usage = msg.get("usage") if isinstance(msg, dict) else None
@@ -235,6 +348,46 @@ def environment(skill_root: Path | None = None) -> dict:
     return env
 
 
+def active_time(stamps: list, idle_gap: int = IDLE_GAP_SECONDS) -> tuple:
+    """Hours of work, excluding stretches where nobody was driving the session.
+
+    Returns `(hours, excluded_count, largest_excluded_seconds)`.
+
+    Wall clock answers "when did this happen", not "how long did it take". An
+    unattended session inflates it without bound — a run measured at 2.6h of
+    work reported a 50.4h span purely because it resumed two days later. Summing
+    only the gaps below `idle_gap` gives the figure people actually mean.
+
+    The two diagnostics exist so the threshold is auditable rather than trusted:
+    if a run excludes many gaps, or one only slightly over the limit, the
+    threshold is wrong for that run and the reader can see it.
+    """
+    parsed = sorted(p for p in (_parse(s) for s in stamps) if p is not None)
+    if len(parsed) < 2:
+        return 0.0, 0, 0.0
+    active = 0.0
+    excluded = 0
+    largest = 0.0
+    for a, b in zip(parsed, parsed[1:]):
+        gap = (b - a).total_seconds()
+        if gap <= 0:
+            continue
+        if gap <= idle_gap:
+            active += gap
+        else:
+            excluded += 1
+            largest = max(largest, gap)
+    return active / 3600, excluded, largest
+
+
+def _parse(stamp: str):
+    """ISO timestamp to datetime, or None when unparseable."""
+    try:
+        return datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
 def duration_hours(first: str, last: str) -> float:
     """Wall-clock hours between two ISO timestamps, 0.0 if unparseable."""
     try:
@@ -273,8 +426,28 @@ def render(stats: TokenStats, rates: dict, env: dict) -> list[str]:
         for note in notes:
             out.append(f"  ! {note}")
         hours = duration_hours(stats.first, stats.last)
+        active, idle_gaps, largest = active_time(stats.stamps)
+        if active:
+            line = f"  active {active:.1f}h"
+            if idle_gaps:
+                line += (
+                    f"  ({idle_gaps} idle gap{'s' if idle_gaps > 1 else ''} over "
+                    f"{IDLE_GAP_SECONDS // 60}m excluded, largest "
+                    f"{largest / 3600:.1f}h)"
+                )
+            else:
+                line += (
+                    f"  (no gap over {IDLE_GAP_SECONDS // 60}m — "
+                    "worked straight through)"
+                )
+            out.append(line)
         if hours:
-            out.append(f"  wall clock {hours:.1f}h  ({stats.first} to {stats.last})")
+            out.append(f"  span {hours:.1f}h  ({stats.first} to {stats.last})")
+            if active and hours > active * 1.5:
+                out.append(
+                    "  ! span is elapsed time, not effort — this run sat idle "
+                    "between sittings"
+                )
         if len(stats.sessions) > 1:
             out.append(
                 f"  ! spans {len(stats.sessions)} sessions — a status line scoped to "
